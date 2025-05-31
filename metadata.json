@@ -1,0 +1,6 @@
+{
+  "name": "Video Stealth Modifier",
+  "description": "Subtly modify your videos to bypass duplicate detection systems. Adjust brightness, contrast, saturation, speed, and audio levels for a fresh upload. Processed videos are in WEBM format.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
