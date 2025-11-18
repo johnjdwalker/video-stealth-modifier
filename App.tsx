@@ -24,6 +24,18 @@ try {
 }
 
 
+const AI_SUGGESTABLE_FIELDS: Array<keyof VideoSettings> = [
+  'brightness',
+  'contrast',
+  'saturation',
+  'playbackSpeed',
+  'volume',
+  'flipHorizontal',
+  'enableRotatingLines',
+  'enablePixelNoise',
+  'audioPreservesPitch',
+];
+
 const App: React.FC = () => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -188,7 +200,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
           volume: {min: 0, max: 100},
       };
 
-      (Object.keys(DEFAULT_VIDEO_SETTINGS) as Array<keyof VideoSettings>).forEach(key => {
+        AI_SUGGESTABLE_FIELDS.forEach(key => {
         if (suggested.hasOwnProperty(key)) {
           const suggestedValue = suggested[key];
           if (typeof suggestedValue === typeof DEFAULT_VIDEO_SETTINGS[key]) {

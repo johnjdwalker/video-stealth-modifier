@@ -1,6 +1,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { VideoSettings } from '../types';
+import { getPresetMask } from '../constants';
 
 // Constants for rotating lines effect configuration
 const FPS = 30; // Should match canvas.captureStream frame rate
@@ -69,7 +70,7 @@ export function useVideoProcessor() {
   };
 
 
-  const processVideo = useCallback(async (videoFile: File, settings: VideoSettings): Promise<string | null> => {
+    const processVideo = useCallback(async (videoFile: File, settings: VideoSettings): Promise<string | null> => {
     setIsProcessing(true);
     setProcessedVideoUrl(null); 
     setProcessingError(null);
@@ -81,7 +82,34 @@ export function useVideoProcessor() {
     rotationAngle2Ref.current = Math.PI / 2;
 
 
-    return new Promise<string | null>((resolve, reject) => {
+      const clampPercent = (value: number, max = 45) => Math.min(Math.max(value, 0), Math.min(max, 95));
+      const presetMask = settings.watermarkPreset === 'custom' ? null : getPresetMask(settings.watermarkPreset);
+      const watermarkPercent = settings.watermarkRemovalEnabled
+        ? (settings.watermarkPreset === 'custom'
+            ? {
+                xPercent: settings.watermarkX,
+                yPercent: settings.watermarkY,
+                widthPercent: settings.watermarkWidth,
+                heightPercent: settings.watermarkHeight,
+              }
+            : presetMask
+              ? {
+                  xPercent: presetMask.xPercent,
+                  yPercent: presetMask.yPercent,
+                  widthPercent: presetMask.widthPercent,
+                  heightPercent: presetMask.heightPercent,
+                }
+              : null)
+        : null;
+
+      let maskClipRect: { x: number; y: number; width: number; height: number } | null = null;
+      let maskCanvas: HTMLCanvasElement | null = null;
+      let maskCtx: CanvasRenderingContext2D | null = null;
+      let cropSourceRect = { sx: 0, sy: 0, sw: 0, sh: 0 };
+      const watermarkBlurPx = Math.max(0, settings.watermarkBlurAmount);
+      const watermarkFeatherPx = Math.max(0, settings.watermarkFeather);
+
+      return new Promise<string | null>((resolve, reject) => {
       const video = document.createElement('video');
       sourceVideoRef.current = video;
 
@@ -110,10 +138,67 @@ export function useVideoProcessor() {
       }
       const audioContext = audioContextRef.current;
       
-      video.onloadedmetadata = async () => {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        
+        video.onloadedmetadata = async () => {
+          const sourceWidth = video.videoWidth;
+          const sourceHeight = video.videoHeight;
+
+          const cropTopPercent = clampPercent(settings.cropTop);
+          const cropBottomPercent = clampPercent(settings.cropBottom);
+          const cropLeftPercent = clampPercent(settings.cropLeft);
+          const cropRightPercent = clampPercent(settings.cropRight);
+
+          const cropTopPx = Math.round((cropTopPercent / 100) * sourceHeight);
+          const cropBottomPx = Math.round((cropBottomPercent / 100) * sourceHeight);
+          const cropLeftPx = Math.round((cropLeftPercent / 100) * sourceWidth);
+          const cropRightPx = Math.round((cropRightPercent / 100) * sourceWidth);
+
+          const croppedWidth = sourceWidth - cropLeftPx - cropRightPx;
+          const croppedHeight = sourceHeight - cropTopPx - cropBottomPx;
+
+          if (croppedWidth < 4 || croppedHeight < 4) {
+            const err = 'Crop settings remove too much of the frame. Reduce the crop percentages.';
+            setProcessingError(err);
+            setIsProcessing(false);
+            cleanup();
+            reject(new Error(err));
+            return;
+          }
+
+          canvas.width = croppedWidth;
+          canvas.height = croppedHeight;
+
+          cropSourceRect = {
+            sx: cropLeftPx,
+            sy: cropTopPx,
+            sw: croppedWidth,
+            sh: croppedHeight,
+          };
+
+          maskClipRect = null;
+          maskCanvas = null;
+          maskCtx = null;
+          if (watermarkPercent) {
+            const maskX = Math.round((watermarkPercent.xPercent / 100) * canvas.width);
+            const maskY = Math.round((watermarkPercent.yPercent / 100) * canvas.height);
+            const maskWidth = Math.max(2, Math.round((watermarkPercent.widthPercent / 100) * canvas.width));
+            const maskHeight = Math.max(2, Math.round((watermarkPercent.heightPercent / 100) * canvas.height));
+            const guard = watermarkFeatherPx + watermarkBlurPx * 0.4;
+            const clipX = Math.max(0, Math.round(maskX - guard));
+            const clipY = Math.max(0, Math.round(maskY - guard));
+            const maxClipWidth = canvas.width - clipX;
+            const maxClipHeight = canvas.height - clipY;
+            const clipWidth = Math.min(maxClipWidth, Math.round(maskWidth + guard * 2));
+            const clipHeight = Math.min(maxClipHeight, Math.round(maskHeight + guard * 2));
+
+            if (clipWidth > 0 && clipHeight > 0) {
+              maskClipRect = { x: clipX, y: clipY, width: clipWidth, height: clipHeight };
+              maskCanvas = document.createElement('canvas');
+              maskCanvas.width = Math.max(1, clipWidth);
+              maskCanvas.height = Math.max(1, clipHeight);
+              maskCtx = maskCanvas.getContext('2d');
+            }
+          }
+
         video.preservesPitch = settings.audioPreservesPitch;
         video.playbackRate = settings.playbackSpeed;
         video.muted = true; 
@@ -214,7 +299,7 @@ export function useVideoProcessor() {
             reject(errorToReject); // Reject promise with an actual Error object
         };
         
-        const rotationIncrementPerFrame = (2 * Math.PI) / (ROTATION_DURATION_SECONDS * FPS);
+          const rotationIncrementPerFrame = (2 * Math.PI) / (ROTATION_DURATION_SECONDS * FPS);
 
         const drawFrame = () => {
           if (!sourceVideoRef.current || sourceVideoRef.current.paused || sourceVideoRef.current.ended || !canvasRef.current || !ctx) {
@@ -226,14 +311,26 @@ export function useVideoProcessor() {
             return;
           }
 
-          ctx.save();
-          if (settings.flipHorizontal) {
-            ctx.translate(canvasRef.current.width, 0);
-            ctx.scale(-1, 1);
-          }
-          ctx.filter = `brightness(${settings.brightness}%) contrast(${settings.contrast}%) saturate(${settings.saturation}%)`;
-          ctx.drawImage(sourceVideoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
-          ctx.restore(); 
+            const baseFilter = `brightness(${settings.brightness}%) contrast(${settings.contrast}%) saturate(${settings.saturation}%)`;
+
+            ctx.save();
+            if (settings.flipHorizontal) {
+              ctx.translate(canvasRef.current.width, 0);
+              ctx.scale(-1, 1);
+            }
+            ctx.filter = baseFilter;
+            ctx.drawImage(
+              sourceVideoRef.current,
+              cropSourceRect.sx,
+              cropSourceRect.sy,
+              cropSourceRect.sw,
+              cropSourceRect.sh,
+              0,
+              0,
+              canvasRef.current.width,
+              canvasRef.current.height
+            );
+            ctx.restore(); 
 
           if (settings.enablePixelNoise && canvasRef.current) {
             const currentCanvas = canvasRef.current;
@@ -282,6 +379,32 @@ export function useVideoProcessor() {
             ctx.stroke();
             ctx.restore();
           }
+
+            if (maskClipRect && maskCanvas && maskCtx && canvasRef.current && maskCtx.canvas.width > 0 && maskCtx.canvas.height > 0) {
+              maskCtx.save();
+              maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+              maskCtx.filter = `blur(${Math.max(0.5, watermarkBlurPx)}px)`;
+              maskCtx.drawImage(
+                canvasRef.current,
+                maskClipRect.x,
+                maskClipRect.y,
+                maskClipRect.width,
+                maskClipRect.height,
+                0,
+                0,
+                maskCanvas.width,
+                maskCanvas.height
+              );
+              maskCtx.restore();
+
+              ctx.save();
+              ctx.globalAlpha = 1;
+              ctx.drawImage(maskCanvas, maskClipRect.x, maskClipRect.y, maskClipRect.width, maskClipRect.height);
+              ctx.globalAlpha = 0.12;
+              ctx.fillStyle = '#050505';
+              ctx.fillRect(maskClipRect.x, maskClipRect.y, maskClipRect.width, maskClipRect.height);
+              ctx.restore();
+            }
 
           if (sourceVideoRef.current.duration > 0) {
              setProgress(Math.min(100, Math.round((sourceVideoRef.current.currentTime / sourceVideoRef.current.duration) * 100)));
