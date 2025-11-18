@@ -18,6 +18,7 @@ export function useVideoProcessor() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameIdRef = useRef<number>(0);
+  const sourceVideoUrlRef = useRef<string | null>(null); // Track object URL for cleanup
 
   // Refs for rotating lines effect state
   const rotationAngle1Ref = useRef<number>(0); // For the line starting horizontally
@@ -39,6 +40,11 @@ export function useVideoProcessor() {
         sourceVideoRef.current.removeAttribute('src'); 
         sourceVideoRef.current.load(); 
         sourceVideoRef.current = null;
+    }
+    // Revoke the object URL to prevent memory leaks
+    if (sourceVideoUrlRef.current) {
+        URL.revokeObjectURL(sourceVideoUrlRef.current);
+        sourceVideoUrlRef.current = null;
     }
     if (canvasRef.current) {
         canvasRef.current = null;
@@ -304,17 +310,6 @@ export function useVideoProcessor() {
            animationFrameIdRef.current = 0;
         };
 
-        video.onerror = (e) => { 
-            const errorMsg = (video.error?.message || 'Unknown video playback error');
-            const err = `Error playing source video: ${errorMsg}`;
-            console.error(err, e);
-            setProcessingError(err);
-            setIsProcessing(false);
-            if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
-            cleanup();
-            reject(new Error(err));
-        };
-
         mediaRecorder.start();
         video.play().catch(err => {
             const errorMsg = `Could not start video playback: ${err.message}`;
@@ -328,16 +323,25 @@ export function useVideoProcessor() {
       };
 
       video.onerror = (e) => { 
-        const errorMsg = (video.error?.message || 'Failed to load video file.');
-        const err =`Error loading video: ${errorMsg}`;
+        // Handle both loading errors (before onloadedmetadata) and playback errors (after)
+        const errorMsg = (video.error?.message || 'Video error occurred');
+        const err = video.readyState === 0 
+          ? `Error loading video: ${errorMsg}`
+          : `Error playing source video: ${errorMsg}`;
         console.error(err, e);
         setProcessingError(err);
         setIsProcessing(false);
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          mediaRecorderRef.current.stop();
+        }
         cleanup();
         reject(new Error(err));
       };
       
-      video.src = URL.createObjectURL(videoFile);
+      // Create and track object URL for proper cleanup
+      const videoUrl = URL.createObjectURL(videoFile);
+      sourceVideoUrlRef.current = videoUrl;
+      video.src = videoUrl;
     }); 
   }, [cleanup]); 
 

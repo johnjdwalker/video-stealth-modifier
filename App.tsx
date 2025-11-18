@@ -33,7 +33,44 @@ const App: React.FC = () => {
       const savedSettings = localStorage.getItem('videoStealthModifierSettings');
       if (savedSettings) {
         const parsed = JSON.parse(savedSettings);
-        return { ...DEFAULT_VIDEO_SETTINGS, ...parsed };
+        
+        // Validate that parsed data matches VideoSettings structure
+        if (typeof parsed === 'object' && parsed !== null) {
+          const validated: VideoSettings = { ...DEFAULT_VIDEO_SETTINGS };
+          
+          // Validate numeric fields with proper ranges
+          if (typeof parsed.brightness === 'number' && parsed.brightness >= 0 && parsed.brightness <= 200) {
+            validated.brightness = parsed.brightness;
+          }
+          if (typeof parsed.contrast === 'number' && parsed.contrast >= 0 && parsed.contrast <= 200) {
+            validated.contrast = parsed.contrast;
+          }
+          if (typeof parsed.saturation === 'number' && parsed.saturation >= 0 && parsed.saturation <= 200) {
+            validated.saturation = parsed.saturation;
+          }
+          if (typeof parsed.playbackSpeed === 'number' && parsed.playbackSpeed >= 0.5 && parsed.playbackSpeed <= 2.0) {
+            validated.playbackSpeed = parsed.playbackSpeed;
+          }
+          if (typeof parsed.volume === 'number' && parsed.volume >= 0 && parsed.volume <= 100) {
+            validated.volume = parsed.volume;
+          }
+          
+          // Validate boolean fields
+          if (typeof parsed.flipHorizontal === 'boolean') {
+            validated.flipHorizontal = parsed.flipHorizontal;
+          }
+          if (typeof parsed.enableRotatingLines === 'boolean') {
+            validated.enableRotatingLines = parsed.enableRotatingLines;
+          }
+          if (typeof parsed.enablePixelNoise === 'boolean') {
+            validated.enablePixelNoise = parsed.enablePixelNoise;
+          }
+          if (typeof parsed.audioPreservesPitch === 'boolean') {
+            validated.audioPreservesPitch = parsed.audioPreservesPitch;
+          }
+          
+          return validated;
+        }
       }
       return DEFAULT_VIDEO_SETTINGS;
     } catch (error) {
