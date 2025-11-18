@@ -320,7 +320,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
               <p className="text-sm text-green-200 mb-3">Your modified video is ready (WEBM format).</p>
               <a
                 href={processedVideoUrl}
-                download={`modified_${videoFile?.name.split('.')[0] || 'video'}.webm`}
+                download={`modified_${videoFile?.name.replace(/\.[^.]+$/, '') || 'video'}.webm`}
                 className="w-full px-6 py-3 bg-green-500 hover:bg-green-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200"
               >
                 <DownloadIcon className="w-5 h-5 mr-2" />

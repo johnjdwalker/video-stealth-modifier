@@ -13,6 +13,8 @@ const VideoUploader: React.FC<VideoUploaderProps> = ({ onFileSelect, disabled })
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files[0]) {
       onFileSelect(event.target.files[0]);
+      // Reset input value to allow selecting the same file again
+      event.target.value = '';
     }
   };
 

@@ -23,7 +23,7 @@ export function useVideoProcessor() {
   const rotationAngle1Ref = useRef<number>(0); // For the line starting horizontally
   const rotationAngle2Ref = useRef<number>(Math.PI / 2); // For the line starting vertically
 
-  const cleanup = useCallback(() => {
+  const cleanup = useCallback(async () => {
     if (animationFrameIdRef.current) {
         cancelAnimationFrame(animationFrameIdRef.current);
         animationFrameIdRef.current = 0;
@@ -44,7 +44,11 @@ export function useVideoProcessor() {
         canvasRef.current = null;
     }
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close().catch(console.error);
+        try {
+            await audioContextRef.current.close();
+        } catch (e) {
+            console.error('Error closing AudioContext:', e);
+        }
         audioContextRef.current = null;
     }
   }, []);
@@ -71,10 +75,16 @@ export function useVideoProcessor() {
 
   const processVideo = useCallback(async (videoFile: File, settings: VideoSettings): Promise<string | null> => {
     setIsProcessing(true);
+    
+    // Revoke previous processed video URL to prevent memory leak
+    if (internalProcessedVideoUrl) {
+      URL.revokeObjectURL(internalProcessedVideoUrl);
+    }
     setProcessedVideoUrl(null); 
+    
     setProcessingError(null);
     setProgress(0);
-    cleanup(); 
+    await cleanup(); // Await cleanup to ensure AudioContext is properly closed
 
     // Reset rotating lines angles
     rotationAngle1Ref.current = 0;
@@ -93,7 +103,7 @@ export function useVideoProcessor() {
         const err = 'Could not get canvas context.';
         setProcessingError(err);
         setIsProcessing(false);
-        cleanup();
+        cleanup().catch(console.error);
         reject(new Error(err));
         return;
       }
@@ -104,13 +114,23 @@ export function useVideoProcessor() {
         const err = 'AudioContext not supported.';
         setProcessingError(err);
         setIsProcessing(false);
-        cleanup();
+        cleanup().catch(console.error);
         reject(new Error(err));
         return;
       }
       const audioContext = audioContextRef.current;
       
       video.onloadedmetadata = async () => {
+        // Validate video has valid dimensions
+        if (!video.videoWidth || !video.videoHeight) {
+          const err = 'Invalid video: Video has no dimensions (width or height is 0). The file may be corrupted or audio-only.';
+          setProcessingError(err);
+          setIsProcessing(false);
+          cleanup().catch(console.error);
+          reject(new Error(err));
+          return;
+        }
+        
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         
@@ -153,7 +173,7 @@ export function useVideoProcessor() {
             console.error(err);
             setProcessingError(err);
             setIsProcessing(false);
-            cleanup();
+            cleanup().catch(console.error);
             reject(new Error(err));
             return;
         }
@@ -165,7 +185,7 @@ export function useVideoProcessor() {
             console.error(err, e);
             setProcessingError(err);
             setIsProcessing(false);
-            cleanup();
+            cleanup().catch(console.error);
             reject(new Error(err));
             return;
         }
@@ -210,7 +230,7 @@ export function useVideoProcessor() {
             console.error(errorMessageText, event); // Log original event for full details
             setProcessingError(errorMessageText); // Update UI with the formatted error message
             setIsProcessing(false);
-            cleanup();
+            cleanup().catch(console.error);
             reject(errorToReject); // Reject promise with an actual Error object
         };
         
@@ -287,8 +307,11 @@ export function useVideoProcessor() {
             ctx.restore();
           }
 
-          if (sourceVideoRef.current.duration > 0) {
-             setProgress(Math.min(100, Math.round((sourceVideoRef.current.currentTime / sourceVideoRef.current.duration) * 100)));
+          if (sourceVideoRef.current.duration > 0 && isFinite(sourceVideoRef.current.duration)) {
+             const progressValue = (sourceVideoRef.current.currentTime / sourceVideoRef.current.duration) * 100;
+             if (isFinite(progressValue)) {
+               setProgress(Math.min(100, Math.round(progressValue)));
+             }
           }
           animationFrameIdRef.current = requestAnimationFrame(drawFrame);
         };
@@ -315,7 +338,7 @@ export function useVideoProcessor() {
             setProcessingError(errorMsg);
             setIsProcessing(false);
             if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
-            cleanup();
+            cleanup().catch(console.error);
             reject(err);
         });
       };
@@ -326,7 +349,7 @@ export function useVideoProcessor() {
         console.error(err, e);
         setProcessingError(err);
         setIsProcessing(false);
-        cleanup();
+        cleanup().catch(console.error);
         reject(new Error(err));
       };
       
