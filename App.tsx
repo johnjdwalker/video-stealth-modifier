@@ -56,8 +56,49 @@ const App: React.FC = () => {
   const [geminiPrompt, setGeminiPrompt] = useState<string>("");
   const [isSuggestingSettings, setIsSuggestingSettings] = useState<boolean>(false);
   const [geminiError, setGeminiError] = useState<string | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [browserCompatibilityError, setBrowserCompatibilityError] = useState<string | null>(null);
 
 
+  // Effect to check browser compatibility on mount
+  useEffect(() => {
+    const checkBrowserCompatibility = () => {
+      const issues: string[] = [];
+      
+      // Check MediaRecorder support
+      if (typeof MediaRecorder === 'undefined') {
+        issues.push('MediaRecorder API (required for video recording)');
+      } else {
+        // Check WEBM support
+        const mimeType = 'video/webm;codecs=vp8,opus';
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          issues.push('WEBM video recording (VP8/Opus codecs)');
+        }
+      }
+      
+      // Check AudioContext support
+      if (typeof AudioContext === 'undefined' && typeof (window as any).webkitAudioContext === 'undefined') {
+        issues.push('AudioContext API (required for audio processing)');
+      }
+      
+      // Check canvas captureStream support
+      const testCanvas = document.createElement('canvas');
+      if (typeof testCanvas.captureStream !== 'function') {
+        issues.push('Canvas captureStream (required for video effects)');
+      }
+      
+      if (issues.length > 0) {
+        setBrowserCompatibilityError(
+          `Your browser doesn't support the following features required by this application:\n\n` +
+          issues.map(issue => `• ${issue}`).join('\n') +
+          `\n\nPlease use a modern browser like Chrome 94+, Firefox 90+, Edge 94+, or Safari 16.4+.`
+        );
+      }
+    };
+    
+    checkBrowserCompatibility();
+  }, []);
+  
   // Effect to save settings to localStorage
   useEffect(() => {
     try {
@@ -103,6 +144,12 @@ const App: React.FC = () => {
     setVideoFile(file);
     setProcessedVideoUrl(null); 
     setGeminiError(null); // Clear AI error on new file
+    setFileError(null); // Clear file error on successful selection
+  };
+  
+  const handleFileError = (error: string) => {
+    setFileError(error);
+    setVideoFile(null);
   };
 
   const handleSettingsChange = (newSettings: VideoSettings) => {
@@ -125,6 +172,7 @@ const App: React.FC = () => {
     setProcessedVideoUrl(null);
     setGeminiPrompt("");
     setGeminiError(null);
+    setFileError(null);
   };
 
   const handleSuggestSettings = async () => {
@@ -236,10 +284,41 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         </p>
       </header>
 
+      {browserCompatibilityError && (
+        <div className="w-full max-w-5xl mb-8">
+          <div className="bg-red-900 border-2 border-red-500 p-6 rounded-lg">
+            <div className="flex items-start">
+              <svg className="w-6 h-6 text-red-400 mr-3 flex-shrink-0 mt-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+              <div>
+                <h3 className="text-xl font-bold text-red-200 mb-2">Browser Compatibility Issue</h3>
+                <p className="text-red-100 whitespace-pre-line">{browserCompatibilityError}</p>
+                <p className="text-red-300 text-sm mt-4">
+                  The application may not work correctly. Please switch to a supported browser for the best experience.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <main className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-3 gap-8">
         <div className="lg:col-span-2 space-y-6">
           {!videoFile ? (
-            <VideoUploader onFileSelect={handleFileSelect} disabled={isProcessing || isSuggestingSettings} />
+            <>
+              <VideoUploader 
+                onFileSelect={handleFileSelect} 
+                onFileError={handleFileError}
+                disabled={isProcessing || isSuggestingSettings} 
+              />
+              {fileError && (
+                <div className="bg-red-700 p-4 rounded-lg text-red-100">
+                  <p className="font-semibold">File Upload Error:</p>
+                  <p className="text-sm">{fileError}</p>
+                </div>
+              )}
+            </>
           ) : (
             <>
               {!previewUrl ? (
