@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { VideoSettings } from './types';
 import { DEFAULT_VIDEO_SETTINGS, APP_TITLE } from './constants';
@@ -136,7 +136,7 @@ const App: React.FC = () => {
     setIsSuggestingSettings(true);
     setGeminiError(null);
 
-    const systemInstruction = `You are an expert video editing assistant. Your goal is to suggest subtle modifications for a video based on the user's request.
+    const systemInstruction = `You are an expert video editing assistant specializing in watermark removal and video modifications. Your goal is to suggest subtle modifications for a video based on the user's request.
 Return your suggestions *only* as a JSON object. Do not include any explanatory text before or after the JSON object.
 The JSON object must strictly adhere to the following structure and data types. All fields are required:
 {
@@ -148,9 +148,19 @@ The JSON object must strictly adhere to the following structure and data types. 
   "flipHorizontal": boolean, /* Example: false. */
   "enableRotatingLines": boolean, /* Example: false. */
   "enablePixelNoise": boolean, /* Example: false. */
-  "audioPreservesPitch": boolean /* Example: true. */
+  "audioPreservesPitch": boolean, /* Example: true. */
+  "cropTop": number, /* Example: 0. Range: 0-50. Percentage to crop from top. */
+  "cropBottom": number, /* Example: 0. Range: 0-50. Percentage to crop from bottom. */
+  "cropLeft": number, /* Example: 0. Range: 0-50. Percentage to crop from left. */
+  "cropRight": number, /* Example: 0. Range: 0-50. Percentage to crop from right. */
+  "zoomScale": number, /* Example: 1.0. Range: 1.0-2.0. Scale factor for zooming. */
+  "blurTopLeft": number, /* Example: 0. Range: 0-20. Blur intensity in pixels for top-left corner. */
+  "blurTopRight": number, /* Example: 0. Range: 0-20. Blur intensity in pixels for top-right corner. */
+  "blurBottomLeft": number, /* Example: 0. Range: 0-20. Blur intensity in pixels for bottom-left corner. */
+  "blurBottomRight": number, /* Example: 0. Range: 0-20. Blur intensity in pixels for bottom-right corner. */
+  "cornerBlurSize": number /* Example: 15. Range: 5-30. Size of corner blur area as percentage. */
 }
-Focus on subtle changes suitable for making a video distinct without being overly dramatic.`;
+For watermark removal: suggest cropping edges or using corner blur where watermarks typically appear (usually corners or bottom). Combine multiple techniques for best results.`;
 
     const userRequestPrompt = `User request: "${geminiPrompt.trim()}"
 
@@ -166,7 +176,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         },
       });
 
-      let jsonStr = response.text.trim();
+      let jsonStr = (response.text || '').trim();
       const fenceRegex = /^```(?:json)?\s*\n?(.*?)\n?\s*```$/s;
       const match = jsonStr.match(fenceRegex);
       if (match && match[1]) {
@@ -180,12 +190,22 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       let allFieldsValid = true;
 
       // Define min/max for clamping
-      const ranges: Record<keyof Pick<VideoSettings, 'brightness'|'contrast'|'saturation'|'playbackSpeed'|'volume'>, {min: number, max: number}> = {
+      const ranges: Record<keyof Pick<VideoSettings, 'brightness'|'contrast'|'saturation'|'playbackSpeed'|'volume'|'cropTop'|'cropBottom'|'cropLeft'|'cropRight'|'zoomScale'|'blurTopLeft'|'blurTopRight'|'blurBottomLeft'|'blurBottomRight'|'cornerBlurSize'>, {min: number, max: number}> = {
           brightness: {min: 0, max: 200},
           contrast: {min: 0, max: 200},
           saturation: {min: 0, max: 200},
           playbackSpeed: {min: 0.5, max: 2.0},
           volume: {min: 0, max: 100},
+          cropTop: {min: 0, max: 50},
+          cropBottom: {min: 0, max: 50},
+          cropLeft: {min: 0, max: 50},
+          cropRight: {min: 0, max: 50},
+          zoomScale: {min: 1.0, max: 2.0},
+          blurTopLeft: {min: 0, max: 20},
+          blurTopRight: {min: 0, max: 20},
+          blurBottomLeft: {min: 0, max: 20},
+          blurBottomRight: {min: 0, max: 20},
+          cornerBlurSize: {min: 5, max: 30},
       };
 
       (Object.keys(DEFAULT_VIDEO_SETTINGS) as Array<keyof VideoSettings>).forEach(key => {
@@ -228,7 +248,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       <header className="w-full max-w-5xl mb-8 text-center">
         <h1 className="text-4xl font-bold text-indigo-400">{APP_TITLE}</h1>
         <p className="text-gray-400 mt-2">
-          Subtly modify your videos. Adjust visual properties, speed, and audio. Compare original with modified preview. Get AI suggestions!
+          Remove watermarks from Sora2 videos using cropping, zooming, and corner blur. Adjust visual properties, speed, and audio. Get AI suggestions!
         </p>
       </header>
 

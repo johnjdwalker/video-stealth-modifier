@@ -226,13 +226,50 @@ export function useVideoProcessor() {
             return;
           }
 
+          const currentCanvas = canvasRef.current;
+          const videoWidth = sourceVideoRef.current.videoWidth;
+          const videoHeight = sourceVideoRef.current.videoHeight;
+
+          // Clear canvas
+          ctx.clearRect(0, 0, currentCanvas.width, currentCanvas.height);
+
           ctx.save();
+          
+          // Apply flip
           if (settings.flipHorizontal) {
-            ctx.translate(canvasRef.current.width, 0);
+            ctx.translate(currentCanvas.width, 0);
             ctx.scale(-1, 1);
           }
+          
+          // Apply filters
           ctx.filter = `brightness(${settings.brightness}%) contrast(${settings.contrast}%) saturate(${settings.saturation}%)`;
-          ctx.drawImage(sourceVideoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
+          
+          // Calculate crop and zoom
+          const cropLeftPx = (settings.cropLeft / 100) * videoWidth;
+          const cropRightPx = (settings.cropRight / 100) * videoWidth;
+          const cropTopPx = (settings.cropTop / 100) * videoHeight;
+          const cropBottomPx = (settings.cropBottom / 100) * videoHeight;
+          
+          const sourceX = cropLeftPx;
+          const sourceY = cropTopPx;
+          const sourceWidth = videoWidth - cropLeftPx - cropRightPx;
+          const sourceHeight = videoHeight - cropTopPx - cropBottomPx;
+          
+          // Apply zoom by scaling the canvas context
+          const scale = settings.zoomScale;
+          const offsetX = (currentCanvas.width * (1 - scale)) / 2;
+          const offsetY = (currentCanvas.height * (1 - scale)) / 2;
+          
+          ctx.translate(offsetX, offsetY);
+          ctx.scale(scale, scale);
+          
+          // Draw video with crop applied
+          ctx.drawImage(
+            sourceVideoRef.current,
+            sourceX, sourceY, sourceWidth, sourceHeight,
+            0, 0, currentCanvas.width, currentCanvas.height
+          );
+          
           ctx.restore(); 
 
           if (settings.enablePixelNoise && canvasRef.current) {
@@ -281,6 +318,44 @@ export function useVideoProcessor() {
             ctx.lineWidth = lineWidth;
             ctx.stroke();
             ctx.restore();
+          }
+
+          // Apply corner blurs for watermark removal
+          if (canvasRef.current) {
+            const currentCanvas = canvasRef.current;
+            const blurSize = (settings.cornerBlurSize / 100) * Math.min(currentCanvas.width, currentCanvas.height);
+            
+            const corners = [
+              { x: 0, y: 0, blur: settings.blurTopLeft, name: 'top-left' }, // Top-left
+              { x: currentCanvas.width - blurSize, y: 0, blur: settings.blurTopRight, name: 'top-right' }, // Top-right
+              { x: 0, y: currentCanvas.height - blurSize, blur: settings.blurBottomLeft, name: 'bottom-left' }, // Bottom-left
+              { x: currentCanvas.width - blurSize, y: currentCanvas.height - blurSize, blur: settings.blurBottomRight, name: 'bottom-right' } // Bottom-right
+            ];
+
+            corners.forEach((corner) => {
+              if (corner.blur > 0) {
+                // Create a temporary canvas to apply blur effect
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = blurSize;
+                tempCanvas.height = blurSize;
+                const tempCtx = tempCanvas.getContext('2d');
+                
+                if (tempCtx) {
+                  // Copy corner region to temp canvas
+                  tempCtx.drawImage(
+                    currentCanvas,
+                    corner.x, corner.y, blurSize, blurSize,
+                    0, 0, blurSize, blurSize
+                  );
+                  
+                  // Apply blur filter and draw back
+                  ctx.save();
+                  ctx.filter = `blur(${corner.blur}px)`;
+                  ctx.drawImage(tempCanvas, corner.x, corner.y, blurSize, blurSize);
+                  ctx.restore();
+                }
+              }
+            });
           }
 
           if (sourceVideoRef.current.duration > 0) {

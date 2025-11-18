@@ -135,6 +135,97 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
         disabled={commonDisabledState}
       />
 
+      {/* Watermark Removal Section */}
+      <div className="pt-4 border-t border-gray-700 mt-6">
+        <h4 className="text-lg font-semibold text-green-400 mb-4">🎯 Watermark Removal</h4>
+        
+        <p className="text-xs text-gray-400 mb-3">Crop edges where watermarks typically appear:</p>
+        <SliderControl
+          label="Crop Top"
+          id="cropTop"
+          value={settings.cropTop}
+          min={0} max={50} step={1} unit="%"
+          onChange={(val) => handleSliderChange('cropTop', val)}
+          disabled={commonDisabledState}
+        />
+        <SliderControl
+          label="Crop Bottom"
+          id="cropBottom"
+          value={settings.cropBottom}
+          min={0} max={50} step={1} unit="%"
+          onChange={(val) => handleSliderChange('cropBottom', val)}
+          disabled={commonDisabledState}
+        />
+        <SliderControl
+          label="Crop Left"
+          id="cropLeft"
+          value={settings.cropLeft}
+          min={0} max={50} step={1} unit="%"
+          onChange={(val) => handleSliderChange('cropLeft', val)}
+          disabled={commonDisabledState}
+        />
+        <SliderControl
+          label="Crop Right"
+          id="cropRight"
+          value={settings.cropRight}
+          min={0} max={50} step={1} unit="%"
+          onChange={(val) => handleSliderChange('cropRight', val)}
+          disabled={commonDisabledState}
+        />
+        
+        <SliderControl
+          label="Zoom Scale"
+          id="zoomScale"
+          value={settings.zoomScale}
+          min={1.0} max={2.0} step={0.05} unit="x"
+          onChange={(val) => handleSliderChange('zoomScale', val)}
+          disabled={commonDisabledState}
+        />
+        <p className="text-xs text-gray-400 mb-3 -mt-1">Zoom in to crop out edge watermarks</p>
+
+        <p className="text-xs text-gray-400 mb-2 mt-4">Blur corners to obscure watermarks:</p>
+        <SliderControl
+          label="Corner Blur Size"
+          id="cornerBlurSize"
+          value={settings.cornerBlurSize}
+          min={5} max={30} step={1} unit="%"
+          onChange={(val) => handleSliderChange('cornerBlurSize', val)}
+          disabled={commonDisabledState}
+        />
+        <SliderControl
+          label="Blur Top-Left"
+          id="blurTopLeft"
+          value={settings.blurTopLeft}
+          min={0} max={20} step={1} unit="px"
+          onChange={(val) => handleSliderChange('blurTopLeft', val)}
+          disabled={commonDisabledState}
+        />
+        <SliderControl
+          label="Blur Top-Right"
+          id="blurTopRight"
+          value={settings.blurTopRight}
+          min={0} max={20} step={1} unit="px"
+          onChange={(val) => handleSliderChange('blurTopRight', val)}
+          disabled={commonDisabledState}
+        />
+        <SliderControl
+          label="Blur Bottom-Left"
+          id="blurBottomLeft"
+          value={settings.blurBottomLeft}
+          min={0} max={20} step={1} unit="px"
+          onChange={(val) => handleSliderChange('blurBottomLeft', val)}
+          disabled={commonDisabledState}
+        />
+        <SliderControl
+          label="Blur Bottom-Right"
+          id="blurBottomRight"
+          value={settings.blurBottomRight}
+          min={0} max={20} step={1} unit="px"
+          onChange={(val) => handleSliderChange('blurBottomRight', val)}
+          disabled={commonDisabledState}
+        />
+      </div>
+
       <div className="pt-2 border-t border-gray-700 mt-4">
         {/* Flip Horizontal Toggle */}
         <div className="flex items-center justify-between mb-3">
