@@ -18,12 +18,15 @@ export function useVideoProcessor() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameIdRef = useRef<number>(0);
+  const videoObjectUrlRef = useRef<string | null>(null);
+  const isStoppingRef = useRef<boolean>(false);
 
   // Refs for rotating lines effect state
   const rotationAngle1Ref = useRef<number>(0); // For the line starting horizontally
   const rotationAngle2Ref = useRef<number>(Math.PI / 2); // For the line starting vertically
 
   const cleanup = useCallback(() => {
+    isStoppingRef.current = false;
     if (animationFrameIdRef.current) {
         cancelAnimationFrame(animationFrameIdRef.current);
         animationFrameIdRef.current = 0;
@@ -39,6 +42,10 @@ export function useVideoProcessor() {
         sourceVideoRef.current.removeAttribute('src'); 
         sourceVideoRef.current.load(); 
         sourceVideoRef.current = null;
+    }
+    if (videoObjectUrlRef.current) {
+        URL.revokeObjectURL(videoObjectUrlRef.current);
+        videoObjectUrlRef.current = null;
     }
     if (canvasRef.current) {
         canvasRef.current = null;
@@ -74,6 +81,7 @@ export function useVideoProcessor() {
     setProcessedVideoUrl(null); 
     setProcessingError(null);
     setProgress(0);
+    isStoppingRef.current = false;
     cleanup(); 
 
     // Reset rotating lines angles
@@ -217,8 +225,9 @@ export function useVideoProcessor() {
         const rotationIncrementPerFrame = (2 * Math.PI) / (ROTATION_DURATION_SECONDS * FPS);
 
         const drawFrame = () => {
-          if (!sourceVideoRef.current || sourceVideoRef.current.paused || sourceVideoRef.current.ended || !canvasRef.current || !ctx) {
-            if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          if (!sourceVideoRef.current || sourceVideoRef.current.paused || sourceVideoRef.current.ended || !canvasRef.current || !ctx || isStoppingRef.current) {
+            if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording' && !isStoppingRef.current) {
+                isStoppingRef.current = true;
                 mediaRecorderRef.current.stop();
             }
             if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
@@ -297,11 +306,12 @@ export function useVideoProcessor() {
         };
         
         video.onended = () => {
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording' && !isStoppingRef.current) {
+            isStoppingRef.current = true;
             mediaRecorderRef.current.stop();
           }
           if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
-           animationFrameIdRef.current = 0;
+          animationFrameIdRef.current = 0;
         };
 
         video.onerror = (e) => { 
@@ -337,7 +347,9 @@ export function useVideoProcessor() {
         reject(new Error(err));
       };
       
-      video.src = URL.createObjectURL(videoFile);
+      const objectUrl = URL.createObjectURL(videoFile);
+      videoObjectUrlRef.current = objectUrl;
+      video.src = objectUrl;
     }); 
   }, [cleanup]); 
 

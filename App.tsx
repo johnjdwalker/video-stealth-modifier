@@ -192,8 +192,8 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         if (suggested.hasOwnProperty(key)) {
           const suggestedValue = suggested[key];
           if (typeof suggestedValue === typeof DEFAULT_VIDEO_SETTINGS[key]) {
-            if (typeof suggestedValue === 'number' && ranges[key as keyof typeof ranges]) {
-              const range = ranges[key as keyof typeof ranges];
+            if (typeof suggestedValue === 'number' && key in ranges) {
+              const range = ranges[key];
               (newSettings[key] as number) = Math.max(range.min, Math.min(range.max, suggestedValue));
             } else {
               (newSettings[key] as any) = suggestedValue;
