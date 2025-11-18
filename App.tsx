@@ -80,19 +80,23 @@ const App: React.FC = () => {
 
   // Effect for creating/revoking object URL for original video preview
   useEffect(() => {
-    let objectUrl: string | null = null;
     if (videoFile) {
-      objectUrl = URL.createObjectURL(videoFile);
+      const objectUrl = URL.createObjectURL(videoFile);
       setPreviewUrl(objectUrl);
-    } else {
-      setPreviewUrl(null); 
-    }
-
-    return () => {
-      if (objectUrl) {
+      
+      // Return cleanup function that revokes this specific URL
+      return () => {
         URL.revokeObjectURL(objectUrl);
-      }
-    };
+      };
+    } else {
+      // When videoFile becomes null, clear preview and revoke any existing URL
+      setPreviewUrl((prevUrl) => {
+        if (prevUrl) {
+          URL.revokeObjectURL(prevUrl);
+        }
+        return null;
+      });
+    }
   }, [videoFile]);
 
   const handleFileSelect = (file: File) => {

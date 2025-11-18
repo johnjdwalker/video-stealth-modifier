@@ -215,6 +215,11 @@ export function useVideoProcessor() {
         };
         
         const rotationIncrementPerFrame = (2 * Math.PI) / (ROTATION_DURATION_SECONDS * FPS);
+        
+        // Pre-calculate pixel noise count to avoid recalculating on every frame (performance optimization)
+        const numNoisePixels = settings.enablePixelNoise 
+          ? Math.floor((canvas.width * canvas.height) * 0.001)
+          : 0;
 
         const drawFrame = () => {
           if (!sourceVideoRef.current || sourceVideoRef.current.paused || sourceVideoRef.current.ended || !canvasRef.current || !ctx) {
@@ -237,7 +242,6 @@ export function useVideoProcessor() {
 
           if (settings.enablePixelNoise && canvasRef.current) {
             const currentCanvas = canvasRef.current;
-            const numNoisePixels = Math.floor((currentCanvas.width * currentCanvas.height) * 0.001); 
             for (let i = 0; i < numNoisePixels; i++) {
                 const x = Math.random() * currentCanvas.width;
                 const y = Math.random() * currentCanvas.height;
@@ -302,17 +306,6 @@ export function useVideoProcessor() {
           }
           if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
            animationFrameIdRef.current = 0;
-        };
-
-        video.onerror = (e) => { 
-            const errorMsg = (video.error?.message || 'Unknown video playback error');
-            const err = `Error playing source video: ${errorMsg}`;
-            console.error(err, e);
-            setProcessingError(err);
-            setIsProcessing(false);
-            if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
-            cleanup();
-            reject(new Error(err));
         };
 
         mediaRecorder.start();
