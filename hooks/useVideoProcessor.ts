@@ -248,6 +248,142 @@ export function useVideoProcessor() {
             }
           }
 
+          if (settings.removeWatermark && canvasRef.current && ctx) {
+            const currentCanvas = canvasRef.current;
+            const width = currentCanvas.width;
+            const height = currentCanvas.height;
+            
+            // Define watermark regions (typically bottom corners and bottom center)
+            // Bottom 15% of video height
+            const watermarkHeight = Math.floor(height * 0.15);
+            const watermarkStartY = height - watermarkHeight;
+            
+            // Corner regions: 20% of width from each side
+            const cornerWidth = Math.floor(width * 0.20);
+            
+            // Center region: middle 30% of width
+            const centerStartX = Math.floor(width * 0.35);
+            const centerEndX = Math.floor(width * 0.65);
+            
+            // Get image data for watermark removal
+            const imageData = ctx.getImageData(0, 0, width, height);
+            const data = imageData.data;
+            
+            // Helper function to get pixel color at coordinates (with bounds checking)
+            const getPixel = (x: number, y: number): [number, number, number, number] => {
+              const px = Math.max(0, Math.min(width - 1, Math.floor(x)));
+              const py = Math.max(0, Math.min(height - 1, Math.floor(y)));
+              const idx = (py * width + px) * 4;
+              return [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
+            };
+            
+            // Helper function to set pixel color
+            const setPixel = (x: number, y: number, r: number, g: number, b: number, a: number) => {
+              const px = Math.max(0, Math.min(width - 1, Math.floor(x)));
+              const py = Math.max(0, Math.min(height - 1, Math.floor(y)));
+              const idx = (py * width + px) * 4;
+              data[idx] = r;
+              data[idx + 1] = g;
+              data[idx + 2] = b;
+              data[idx + 3] = a;
+            };
+            
+            // Improved inpainting function: fill watermark region using nearby pixels
+            const inpaintRegion = (startX: number, endX: number, startY: number, endY: number) => {
+              const sampleRadius = Math.max(10, Math.floor(Math.min(width, height) * 0.05)); // Adaptive radius
+              
+              for (let y = startY; y < endY; y++) {
+                for (let x = startX; x < endX; x++) {
+                  const samples: number[][] = [];
+                  const sampleCount = 30; // Increased sample count for better quality
+                  
+                  // Calculate distance from watermark edge for better blending
+                  const distFromTop = y - startY;
+                  const blendFactor = Math.min(1, distFromTop / 5); // Gradual blending
+                  
+                  for (let i = 0; i < sampleCount; i++) {
+                    // Primary: Sample from above the watermark region
+                    const offsetY = 1 + Math.floor(Math.random() * sampleRadius);
+                    const offsetX = Math.floor((Math.random() - 0.5) * sampleRadius * 2);
+                    const sampleY = startY - offsetY;
+                    const sampleX = x + offsetX;
+                    
+                    if (sampleY >= 0 && sampleX >= 0 && sampleX < width) {
+                      samples.push(getPixel(sampleX, sampleY));
+                    }
+                    
+                    // Secondary: Sample from sides (especially for corners)
+                    if (x < cornerWidth || x >= width - cornerWidth) {
+                      const sideOffset = 1 + Math.floor(Math.random() * sampleRadius);
+                      const sideX = x < cornerWidth 
+                        ? cornerWidth + sideOffset
+                        : width - cornerWidth - sideOffset;
+                      const sideY = y + Math.floor((Math.random() - 0.5) * sampleRadius);
+                      
+                      if (sideX >= 0 && sideX < width && sideY >= 0 && sideY < height) {
+                        samples.push(getPixel(sideX, sideY));
+                      }
+                    }
+                    
+                    // Tertiary: Sample from diagonal directions for smoother transitions
+                    const angle = Math.random() * Math.PI * 2;
+                    const diagDist = 1 + Math.random() * sampleRadius;
+                    const diagX = x + Math.cos(angle) * diagDist;
+                    const diagY = startY - Math.abs(Math.sin(angle)) * diagDist;
+                    
+                    if (diagY >= 0 && diagX >= 0 && diagX < width) {
+                      samples.push(getPixel(diagX, diagY));
+                    }
+                  }
+                  
+                  if (samples.length > 0) {
+                    // Weighted average: prefer samples closer to the pixel
+                    let totalWeight = 0;
+                    let r = 0, g = 0, b = 0, a = 0;
+                    
+                    for (const sample of samples) {
+                      // Simple weighting (could be improved with distance calculation)
+                      const weight = 1;
+                      totalWeight += weight;
+                      r += sample[0] * weight;
+                      g += sample[1] * weight;
+                      b += sample[2] * weight;
+                      a += sample[3] * weight;
+                    }
+                    
+                    r = Math.round(r / totalWeight);
+                    g = Math.round(g / totalWeight);
+                    b = Math.round(b / totalWeight);
+                    a = Math.round(a / totalWeight);
+                    
+                    // Blend with original pixel for smoother transition at edges
+                    if (blendFactor < 1) {
+                      const [origR, origG, origB, origA] = getPixel(x, y);
+                      r = Math.round(r * blendFactor + origR * (1 - blendFactor));
+                      g = Math.round(g * blendFactor + origG * (1 - blendFactor));
+                      b = Math.round(b * blendFactor + origB * (1 - blendFactor));
+                      a = Math.round(a * blendFactor + origA * (1 - blendFactor));
+                    }
+                    
+                    setPixel(x, y, r, g, b, a);
+                  }
+                }
+              }
+            };
+            
+            // Remove watermarks from bottom-left corner
+            inpaintRegion(0, cornerWidth, watermarkStartY, height);
+            
+            // Remove watermarks from bottom-right corner
+            inpaintRegion(width - cornerWidth, width, watermarkStartY, height);
+            
+            // Remove watermarks from bottom-center
+            inpaintRegion(centerStartX, centerEndX, watermarkStartY, height);
+            
+            // Put the modified image data back
+            ctx.putImageData(imageData, 0, 0);
+          }
+
           if (settings.enableRotatingLines && canvasRef.current) {
             const currentCanvas = canvasRef.current;
             const centerX = currentCanvas.width / 2;

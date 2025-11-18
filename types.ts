@@ -8,6 +8,7 @@ export interface VideoSettings {
   enableRotatingLines: boolean; // True to add rotating lines effect
   enablePixelNoise: boolean; // True to add subtle pixel noise
   audioPreservesPitch: boolean; // True to preserve audio pitch when changing speed
+  removeWatermark: boolean; // True to remove watermarks (typically in bottom corners/center)
 }
 
 // DEFAULT_VIDEO_SETTINGS is defined and exported from constants.ts

@@ -10,6 +10,7 @@ export const DEFAULT_VIDEO_SETTINGS: VideoSettings = {
   enableRotatingLines: false,
   enablePixelNoise: false,
   audioPreservesPitch: true,
+  removeWatermark: false,
 };
 
 export const APP_TITLE = "Video Stealth Modifier";

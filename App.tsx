@@ -148,7 +148,8 @@ The JSON object must strictly adhere to the following structure and data types. 
   "flipHorizontal": boolean, /* Example: false. */
   "enableRotatingLines": boolean, /* Example: false. */
   "enablePixelNoise": boolean, /* Example: false. */
-  "audioPreservesPitch": boolean /* Example: true. */
+  "audioPreservesPitch": boolean, /* Example: true. */
+  "removeWatermark": boolean /* Example: false. Set to true if user wants to remove watermarks. */
 }
 Focus on subtle changes suitable for making a video distinct without being overly dramatic.`;
 

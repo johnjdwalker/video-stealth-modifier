@@ -34,7 +34,7 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
     onSettingsChange({ ...settings, [key]: value });
   };
 
-  const handleToggleChange = (key: keyof Pick<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch'>, value: boolean) => {
+  const handleToggleChange = (key: keyof Pick<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch' | 'removeWatermark'>, value: boolean) => {
     onSettingsChange({ ...settings, [key]: value });
   };
 
@@ -240,8 +240,36 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
             />
           </button>
         </div>
-        <p id="audio-pitch-description" className={`text-xs text-gray-400 mt-1 ${commonDisabledState ? 'opacity-70' : ''}`}>
+        <p id="audio-pitch-description" className={`text-xs text-gray-400 mt-1 mb-3 ${commonDisabledState ? 'opacity-70' : ''}`}>
             'On' maintains original pitch with speed changes. 'Off' shifts pitch.
+        </p>
+
+        {/* Remove Watermark Toggle */}
+        <div className="flex items-center justify-between pt-2 border-t border-gray-700 mt-4">
+          <label htmlFor="removeWatermark" className={`text-sm font-medium text-gray-300 ${commonDisabledState ? 'opacity-70' : ''}`}>
+            Remove Watermark: <span className="font-semibold text-indigo-400">{settings.removeWatermark ? 'On' : 'Off'}</span>
+          </label>
+          <button
+            type="button"
+            id="removeWatermark"
+            onClick={() => handleToggleChange('removeWatermark', !settings.removeWatermark)}
+            disabled={commonDisabledState}
+            className={`${
+              settings.removeWatermark ? 'bg-indigo-600' : 'bg-gray-600'
+            } relative inline-flex items-center h-6 rounded-full w-11 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-indigo-500 disabled:opacity-50`}
+            aria-pressed={settings.removeWatermark}
+            aria-describedby="watermark-removal-description"
+          >
+            <span className="sr-only">Remove Watermark</span>
+            <span
+              className={`${
+                settings.removeWatermark ? 'translate-x-6' : 'translate-x-1'
+              } inline-block w-4 h-4 transform bg-white rounded-full transition-transform`}
+            />
+          </button>
+        </div>
+        <p id="watermark-removal-description" className={`text-xs text-gray-400 mt-1 ${commonDisabledState ? 'opacity-70' : ''}`}>
+            Removes watermarks from Sora2 videos (bottom corners/center). Effect in processed video.
         </p>
       </div>
     </div>
