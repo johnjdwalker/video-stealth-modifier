@@ -5,6 +5,7 @@ import { DEFAULT_VIDEO_SETTINGS } from '../constants';
 import SliderControl from './SliderControl';
 import ResetIcon from './icons/ResetIcon';
 import ProcessingSpinnerIcon from './icons/ProcessingSpinnerIcon'; // For AI suggestion loading
+import WatermarkRemovalControls from './WatermarkRemovalControls';
 
 interface ModificationControlsProps {
   settings: VideoSettings;
@@ -30,7 +31,7 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
   aiAvailable
  }) => {
   
-  const handleSliderChange = (key: keyof Omit<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch'>, value: number) => {
+  const handleSliderChange = (key: 'brightness' | 'contrast' | 'saturation' | 'playbackSpeed' | 'volume', value: number) => {
     onSettingsChange({ ...settings, [key]: value });
   };
 
@@ -243,6 +244,14 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
         <p id="audio-pitch-description" className={`text-xs text-gray-400 mt-1 ${commonDisabledState ? 'opacity-70' : ''}`}>
             'On' maintains original pitch with speed changes. 'Off' shifts pitch.
         </p>
+      </div>
+
+      <div className="mt-8 pt-6 border-t border-gray-700">
+        <WatermarkRemovalControls
+          settings={settings}
+          onSettingsChange={onSettingsChange}
+          disabled={commonDisabledState}
+        />
       </div>
     </div>
   );
