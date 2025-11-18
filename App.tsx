@@ -63,6 +63,16 @@ const App: React.FC = () => {
   const [browserCompatibilityError, setBrowserCompatibilityError] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
 
+  const handleProcessVideo = useCallback(async () => {
+    if (videoFile) {
+      try {
+        await processVideo(videoFile, currentSettings);
+      } catch (error) {
+        console.error("Processing failed in App:", error);
+        // Error is handled by useVideoProcessor's processingError state
+      }
+    }
+  }, [videoFile, currentSettings, processVideo]);
 
   // Effect to add keyboard shortcuts
   useEffect(() => {
@@ -213,17 +223,6 @@ const App: React.FC = () => {
 
   const handleSettingsChange = (newSettings: VideoSettings) => {
     setCurrentSettings(newSettings); 
-  };
-
-  const handleProcessVideo = async () => {
-    if (videoFile) {
-      try {
-        await processVideo(videoFile, currentSettings); 
-      } catch (error) {
-        console.error("Processing failed in App:", error);
-        // Error is handled by useVideoProcessor's processingError state
-      }
-    }
   };
 
   const handleUploadDifferent = () => {
