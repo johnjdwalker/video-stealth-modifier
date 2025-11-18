@@ -24,6 +24,18 @@ try {
 }
 
 
+const AI_CONTROLLABLE_KEYS: Array<keyof VideoSettings> = [
+  'brightness',
+  'contrast',
+  'saturation',
+  'playbackSpeed',
+  'volume',
+  'flipHorizontal',
+  'enableRotatingLines',
+  'enablePixelNoise',
+  'audioPreservesPitch',
+];
+
 const App: React.FC = () => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -173,45 +185,51 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         jsonStr = match[1].trim();
       }
 
-      const suggested = JSON.parse(jsonStr);
-      
-      // Validate and apply settings
-      const newSettings: VideoSettings = { ...DEFAULT_VIDEO_SETTINGS }; // Start with defaults
-      let allFieldsValid = true;
+        const suggested = JSON.parse(jsonStr);
+        
+        const newSettings: VideoSettings = { ...currentSettings };
+        const ranges: Record<keyof Pick<VideoSettings, 'brightness' | 'contrast' | 'saturation' | 'playbackSpeed' | 'volume'>, { min: number; max: number }> = {
+          brightness: { min: 0, max: 200 },
+          contrast: { min: 0, max: 200 },
+          saturation: { min: 0, max: 200 },
+          playbackSpeed: { min: 0.5, max: 2.0 },
+          volume: { min: 0, max: 100 },
+        };
 
-      // Define min/max for clamping
-      const ranges: Record<keyof Pick<VideoSettings, 'brightness'|'contrast'|'saturation'|'playbackSpeed'|'volume'>, {min: number, max: number}> = {
-          brightness: {min: 0, max: 200},
-          contrast: {min: 0, max: 200},
-          saturation: {min: 0, max: 200},
-          playbackSpeed: {min: 0.5, max: 2.0},
-          volume: {min: 0, max: 100},
-      };
+        const missingFields: string[] = [];
+        const invalidFields: string[] = [];
 
-      (Object.keys(DEFAULT_VIDEO_SETTINGS) as Array<keyof VideoSettings>).forEach(key => {
-        if (suggested.hasOwnProperty(key)) {
-          const suggestedValue = suggested[key];
-          if (typeof suggestedValue === typeof DEFAULT_VIDEO_SETTINGS[key]) {
-            if (typeof suggestedValue === 'number' && ranges[key as keyof typeof ranges]) {
-              const range = ranges[key as keyof typeof ranges];
-              (newSettings[key] as number) = Math.max(range.min, Math.min(range.max, suggestedValue));
+        AI_CONTROLLABLE_KEYS.forEach((key) => {
+          if (Object.prototype.hasOwnProperty.call(suggested, key)) {
+            const suggestedValue = suggested[key];
+            const expectedType = typeof DEFAULT_VIDEO_SETTINGS[key];
+            if (typeof suggestedValue === expectedType) {
+              if (typeof suggestedValue === 'number' && ranges[key as keyof typeof ranges]) {
+                const range = ranges[key as keyof typeof ranges];
+                (newSettings[key] as number) = Math.max(range.min, Math.min(range.max, suggestedValue));
+              } else {
+                (newSettings[key] as typeof suggestedValue) = suggestedValue;
+              }
             } else {
-              (newSettings[key] as any) = suggestedValue;
+              console.warn(`AI suggestion for '${String(key)}' has mismatched type. Expected ${expectedType}, got ${typeof suggestedValue}.`);
+              invalidFields.push(String(key));
             }
           } else {
-            console.warn(`AI suggestion for '${key}' has mismatched type. Expected ${typeof DEFAULT_VIDEO_SETTINGS[key]}, got ${typeof suggestedValue}. Using default.`);
-            allFieldsValid = false; // Or keep default from newSettings initialization
+            missingFields.push(String(key));
           }
-        } else {
-          console.warn(`AI suggestion missing field '${key}'. Using default.`);
-          allFieldsValid = false; // Or keep default
+        });
+        
+        setCurrentSettings(newSettings);
+        if (invalidFields.length || missingFields.length) {
+          const issues: string[] = [];
+          if (invalidFields.length) {
+            issues.push(`invalid type for ${invalidFields.join(', ')}`);
+          }
+          if (missingFields.length) {
+            issues.push(`missing ${missingFields.join(', ')}`);
+          }
+          setGeminiError(`AI suggestion partially applied (${issues.join('; ')}). Kept previous values for the affected settings.`);
         }
-      });
-      
-      setCurrentSettings(newSettings);
-      if (!allFieldsValid) {
-        setGeminiError("AI suggestion was partially applied. Some fields were missing or invalid and set to defaults.");
-      }
 
     } catch (e: any) {
       console.error("Error getting or parsing AI suggestions:", e);
@@ -225,12 +243,12 @@ Based on the user's request, provide the JSON settings object as instructed.`;
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col items-center p-4 sm:p-8">
-      <header className="w-full max-w-5xl mb-8 text-center">
-        <h1 className="text-4xl font-bold text-indigo-400">{APP_TITLE}</h1>
-        <p className="text-gray-400 mt-2">
-          Subtly modify your videos. Adjust visual properties, speed, and audio. Compare original with modified preview. Get AI suggestions!
-        </p>
-      </header>
+        <header className="w-full max-w-5xl mb-8 text-center">
+          <h1 className="text-4xl font-bold text-indigo-400">{APP_TITLE}</h1>
+          <p className="text-gray-400 mt-2">
+            Subtly modify your videos, including removing the baked-in Sora2 watermark. Adjust visual properties, speed, and audio, compare original vs. modified previews, and even get AI suggestions.
+          </p>
+        </header>
 
       <main className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-3 gap-8">
         <div className="lg:col-span-2 space-y-6">

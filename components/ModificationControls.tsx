@@ -30,12 +30,16 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
   aiAvailable
  }) => {
   
-  const handleSliderChange = (key: keyof Omit<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch'>, value: number) => {
+  const handleSliderChange = (key: keyof Omit<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch' | 'removeWatermark' | 'watermarkStrategy'>, value: number) => {
     onSettingsChange({ ...settings, [key]: value });
   };
 
-  const handleToggleChange = (key: keyof Pick<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch'>, value: boolean) => {
+  const handleToggleChange = (key: keyof Pick<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch' | 'removeWatermark'>, value: boolean) => {
     onSettingsChange({ ...settings, [key]: value });
+  };
+
+  const handleStrategyChange = (value: VideoSettings['watermarkStrategy']) => {
+    onSettingsChange({ ...settings, watermarkStrategy: value });
   };
 
   const handleReset = () => {
@@ -243,6 +247,100 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
         <p id="audio-pitch-description" className={`text-xs text-gray-400 mt-1 ${commonDisabledState ? 'opacity-70' : ''}`}>
             'On' maintains original pitch with speed changes. 'Off' shifts pitch.
         </p>
+
+          <div className="mt-6 pt-5 border-t border-gray-700">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <label htmlFor="removeWatermark" className={`text-sm font-medium text-gray-300 ${commonDisabledState ? 'opacity-70' : ''}`}>
+                  Sora2 Watermark Removal
+                </label>
+                <p className="text-xs text-gray-400 mt-1">
+                  Targets the branded mark Sora2 adds near the lower-left edge. Tweak the mask if your export uses a different position.
+                </p>
+              </div>
+              <button
+                type="button"
+                id="removeWatermark"
+                onClick={() => handleToggleChange('removeWatermark', !settings.removeWatermark)}
+                disabled={commonDisabledState}
+                className={`${settings.removeWatermark ? 'bg-indigo-600' : 'bg-gray-600'} relative inline-flex items-center h-6 rounded-full w-11 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-indigo-500 disabled:opacity-50`}
+                aria-pressed={settings.removeWatermark}
+              >
+                <span className="sr-only">Toggle watermark removal</span>
+                <span
+                  className={`${settings.removeWatermark ? 'translate-x-6' : 'translate-x-1'} inline-block w-4 h-4 transform bg-white rounded-full transition-transform`}
+                />
+              </button>
+            </div>
+
+            <div className={`space-y-4 transition-opacity ${commonDisabledState || !settings.removeWatermark ? 'opacity-50 pointer-events-none' : ''}`}>
+              <div>
+                <label htmlFor="watermarkStrategy" className="block text-sm font-medium text-gray-300 mb-1">
+                  Removal strategy
+                </label>
+                <select
+                  id="watermarkStrategy"
+                  value={settings.watermarkStrategy}
+                  onChange={(e) => handleStrategyChange(e.target.value as VideoSettings['watermarkStrategy'])}
+                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded-md text-gray-100 focus:ring-indigo-500 focus:border-indigo-500"
+                >
+                  <option value="clone">Clone nearby pixels (best for gradients)</option>
+                  <option value="blur">Blur the region</option>
+                  <option value="pixelate">Pixelate the region</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <SliderControl
+                  label="Mask X Position"
+                  id="watermarkXPercent"
+                  value={settings.watermarkXPercent}
+                  min={0}
+                  max={90}
+                  step={0.5}
+                  unit="%"
+                  onChange={(val) => handleSliderChange('watermarkXPercent', val)}
+                  disabled={commonDisabledState || !settings.removeWatermark}
+                />
+                <SliderControl
+                  label="Mask Y Position"
+                  id="watermarkYPercent"
+                  value={settings.watermarkYPercent}
+                  min={0}
+                  max={95}
+                  step={0.5}
+                  unit="%"
+                  onChange={(val) => handleSliderChange('watermarkYPercent', val)}
+                  disabled={commonDisabledState || !settings.removeWatermark}
+                />
+                <SliderControl
+                  label="Mask Width"
+                  id="watermarkWidthPercent"
+                  value={settings.watermarkWidthPercent}
+                  min={5}
+                  max={60}
+                  step={0.5}
+                  unit="%"
+                  onChange={(val) => handleSliderChange('watermarkWidthPercent', val)}
+                  disabled={commonDisabledState || !settings.removeWatermark}
+                />
+                <SliderControl
+                  label="Mask Height"
+                  id="watermarkHeightPercent"
+                  value={settings.watermarkHeightPercent}
+                  min={4}
+                  max={40}
+                  step={0.5}
+                  unit="%"
+                  onChange={(val) => handleSliderChange('watermarkHeightPercent', val)}
+                  disabled={commonDisabledState || !settings.removeWatermark}
+                />
+              </div>
+              <p className="text-xs text-gray-400">
+                Tip: Default Sora2 exports line up with X≈4%, Y≈82%, width≈22%, height≈10%.
+              </p>
+            </div>
+          </div>
       </div>
     </div>
   );

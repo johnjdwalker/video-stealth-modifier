@@ -1,4 +1,3 @@
-
 import React from 'react';
 
 interface SliderControlProps {
@@ -14,10 +13,11 @@ interface SliderControlProps {
 }
 
 const SliderControl: React.FC<SliderControlProps> = ({ label, id, value, min, max, step, unit = '', onChange, disabled }) => {
+  const decimalPlaces = step < 1 || unit === 'x' ? 1 : 0;
   return (
     <div className="mb-4">
       <label htmlFor={id} className={`block text-sm font-medium text-gray-300 mb-1 ${disabled ? 'opacity-70' : ''}`}>
-        {label}: <span className="font-semibold text-indigo-400">{value.toFixed(unit === 'x' ? 1: 0)}{unit}</span>
+        {label}: <span className="font-semibold text-indigo-400">{value.toFixed(decimalPlaces)}{unit}</span>
       </label>
       <input
         type="range"

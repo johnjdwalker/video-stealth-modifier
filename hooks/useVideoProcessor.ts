@@ -5,19 +5,27 @@ import { VideoSettings } from '../types';
 // Constants for rotating lines effect configuration
 const FPS = 30; // Should match canvas.captureStream frame rate
 const ROTATION_DURATION_SECONDS = 30; // Duration for one full 360-degree rotation
+const MIN_WATERMARK_DIMENSION_PX = 4;
+
+const clampValue = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+const percentToPixels = (percent: number, total: number) => {
+  const safePercent = clampValue(Number.isFinite(percent) ? percent : 0, 0, 100);
+  return Math.round((safePercent / 100) * total);
+};
 
 export function useVideoProcessor() {
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [internalProcessedVideoUrl, setInternalProcessedVideoUrl] = useState<string | null>(null);
-  const [processingError, setProcessingError] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [internalProcessedVideoUrl, setInternalProcessedVideoUrl] = useState<string | null>(null);
+    const [processingError, setProcessingError] = useState<string | null>(null);
+    const [progress, setProgress] = useState(0);
 
-  const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const animationFrameIdRef = useRef<number>(0);
+    const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const watermarkPixelateHelperRef = useRef<HTMLCanvasElement | null>(null);
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const recordedChunksRef = useRef<Blob[]>([]);
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const animationFrameIdRef = useRef<number>(0);
 
   // Refs for rotating lines effect state
   const rotationAngle1Ref = useRef<number>(0); // For the line starting horizontally
@@ -43,6 +51,11 @@ export function useVideoProcessor() {
     if (canvasRef.current) {
         canvasRef.current = null;
     }
+      if (watermarkPixelateHelperRef.current) {
+          watermarkPixelateHelperRef.current.width = 0;
+          watermarkPixelateHelperRef.current.height = 0;
+          watermarkPixelateHelperRef.current = null;
+      }
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close().catch(console.error);
         audioContextRef.current = null;
@@ -214,9 +227,118 @@ export function useVideoProcessor() {
             reject(errorToReject); // Reject promise with an actual Error object
         };
         
-        const rotationIncrementPerFrame = (2 * Math.PI) / (ROTATION_DURATION_SECONDS * FPS);
+          const rotationIncrementPerFrame = (2 * Math.PI) / (ROTATION_DURATION_SECONDS * FPS);
 
-        const drawFrame = () => {
+          const applyWatermarkMask = () => {
+            if (!settings.removeWatermark || !canvasRef.current) {
+              return;
+            }
+            const renderCanvas = canvasRef.current;
+            if (!renderCanvas.width || !renderCanvas.height) {
+              return;
+            }
+
+            const maskWidth = clampValue(
+              percentToPixels(settings.watermarkWidthPercent, renderCanvas.width),
+              MIN_WATERMARK_DIMENSION_PX,
+              renderCanvas.width
+            );
+            const maskHeight = clampValue(
+              percentToPixels(settings.watermarkHeightPercent, renderCanvas.height),
+              MIN_WATERMARK_DIMENSION_PX,
+              renderCanvas.height
+            );
+
+            if (maskWidth <= 0 || maskHeight <= 0) {
+              return;
+            }
+
+            const requestedX = percentToPixels(settings.watermarkXPercent, renderCanvas.width);
+            const requestedY = percentToPixels(settings.watermarkYPercent, renderCanvas.height);
+            const destX = clampValue(requestedX, 0, Math.max(0, renderCanvas.width - maskWidth));
+            const destY = clampValue(requestedY, 0, Math.max(0, renderCanvas.height - maskHeight));
+
+            const blurRegion = () => {
+              ctx.save();
+              const blurRadius = Math.max(2, Math.round(Math.min(maskWidth, maskHeight) * 0.12));
+              ctx.filter = `blur(${blurRadius}px)`;
+              ctx.drawImage(renderCanvas, destX, destY, maskWidth, maskHeight, destX, destY, maskWidth, maskHeight);
+              ctx.restore();
+              return true;
+            };
+
+            const cloneRegion = () => {
+              const offset = Math.max(maskHeight, Math.round(maskHeight * 0.4));
+              let sampleY = destY - offset;
+              if (sampleY < 0) {
+                sampleY = destY + offset;
+              }
+              sampleY = clampValue(sampleY, 0, Math.max(0, renderCanvas.height - maskHeight));
+
+              let sampleX = destX;
+              if (sampleX + maskWidth > renderCanvas.width) {
+                sampleX = renderCanvas.width - maskWidth;
+              }
+              sampleX = clampValue(sampleX, 0, Math.max(0, renderCanvas.width - maskWidth));
+
+              const isSameRegion = Math.abs(sampleX - destX) < 1 && Math.abs(sampleY - destY) < 1;
+              if (isSameRegion) {
+                return false;
+              }
+
+              ctx.drawImage(renderCanvas, sampleX, sampleY, maskWidth, maskHeight, destX, destY, maskWidth, maskHeight);
+              return true;
+            };
+
+            const pixelateRegion = () => {
+              if (!watermarkPixelateHelperRef.current) {
+                watermarkPixelateHelperRef.current = document.createElement('canvas');
+              }
+              const helperCanvas = watermarkPixelateHelperRef.current;
+              if (!helperCanvas) {
+                return false;
+              }
+              const helperCtx = helperCanvas.getContext('2d');
+              if (!helperCtx) {
+                return false;
+              }
+
+              const blockSize = Math.max(4, Math.round(Math.min(maskWidth, maskHeight) / 18));
+              const sampleWidth = Math.max(1, Math.floor(maskWidth / blockSize));
+              const sampleHeight = Math.max(1, Math.floor(maskHeight / blockSize));
+
+              helperCanvas.width = sampleWidth;
+              helperCanvas.height = sampleHeight;
+              helperCtx.imageSmoothingEnabled = false;
+              helperCtx.clearRect(0, 0, sampleWidth, sampleHeight);
+              helperCtx.drawImage(renderCanvas, destX, destY, maskWidth, maskHeight, 0, 0, sampleWidth, sampleHeight);
+
+              const originalSmoothing = ctx.imageSmoothingEnabled;
+              ctx.imageSmoothingEnabled = false;
+              ctx.drawImage(helperCanvas, 0, 0, sampleWidth, sampleHeight, destX, destY, maskWidth, maskHeight);
+              ctx.imageSmoothingEnabled = originalSmoothing;
+              return true;
+            };
+
+            switch (settings.watermarkStrategy) {
+              case 'clone':
+                if (!cloneRegion()) {
+                  blurRegion();
+                }
+                break;
+              case 'pixelate':
+                if (!pixelateRegion()) {
+                  blurRegion();
+                }
+                break;
+              case 'blur':
+              default:
+                blurRegion();
+                break;
+            }
+          };
+
+          const drawFrame = () => {
           if (!sourceVideoRef.current || sourceVideoRef.current.paused || sourceVideoRef.current.ended || !canvasRef.current || !ctx) {
             if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
                 mediaRecorderRef.current.stop();
@@ -233,9 +355,11 @@ export function useVideoProcessor() {
           }
           ctx.filter = `brightness(${settings.brightness}%) contrast(${settings.contrast}%) saturate(${settings.saturation}%)`;
           ctx.drawImage(sourceVideoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
-          ctx.restore(); 
+            ctx.restore(); 
 
-          if (settings.enablePixelNoise && canvasRef.current) {
+            applyWatermarkMask();
+
+            if (settings.enablePixelNoise && canvasRef.current) {
             const currentCanvas = canvasRef.current;
             const numNoisePixels = Math.floor((currentCanvas.width * currentCanvas.height) * 0.001); 
             for (let i = 0; i < numNoisePixels; i++) {
@@ -269,7 +393,7 @@ export function useVideoProcessor() {
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
             ctx.lineWidth = lineWidth;
             ctx.stroke();
-            ctx.restore();
+              ctx.restore(); 
 
             ctx.save();
             ctx.translate(centerX, centerY);
