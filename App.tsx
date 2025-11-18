@@ -6,6 +6,7 @@ import { DEFAULT_VIDEO_SETTINGS, APP_TITLE } from './constants';
 import VideoUploader from './components/VideoUploader';
 import VideoPlayer from './components/VideoPlayer';
 import ModificationControls from './components/ModificationControls';
+import VideoInfo from './components/VideoInfo';
 import { useVideoProcessor } from './hooks/useVideoProcessor';
 import DownloadIcon from './components/icons/DownloadIcon';
 import ProcessingSpinnerIcon from './components/icons/ProcessingSpinnerIcon';
@@ -46,7 +47,9 @@ const App: React.FC = () => {
   
   const { 
     processVideo, 
-    isProcessing, 
+    cancelProcessing,
+    isProcessing,
+    isCancelling,
     processedVideoUrl, 
     processingError, 
     progress,
@@ -58,8 +61,52 @@ const App: React.FC = () => {
   const [geminiError, setGeminiError] = useState<string | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [browserCompatibilityError, setBrowserCompatibilityError] = useState<string | null>(null);
+  const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
 
 
+  // Effect to add keyboard shortcuts
+  useEffect(() => {
+    const handleKeyPress = (e: KeyboardEvent) => {
+      // Use Cmd on Mac, Ctrl on Windows/Linux
+      const modifier = e.metaKey || e.ctrlKey;
+      
+      // Ctrl/Cmd + U: Upload video
+      if (modifier && e.key === 'u') {
+        e.preventDefault();
+        if (!videoFile && !isProcessing && !isSuggestingSettings) {
+          document.querySelector('input[type="file"]')?.dispatchEvent(new MouseEvent('click'));
+        }
+      }
+      
+      // Ctrl/Cmd + P: Process video
+      if (modifier && e.key === 'p') {
+        e.preventDefault();
+        if (videoFile && !isProcessing && !isSuggestingSettings) {
+          handleProcessVideo();
+        }
+      }
+      
+      // Ctrl/Cmd + D: Download processed video
+      if (modifier && e.key === 'd') {
+        e.preventDefault();
+        if (processedVideoUrl && !isProcessing) {
+          const link = document.querySelector('a[download]') as HTMLAnchorElement;
+          link?.click();
+        }
+      }
+      
+      // Escape: Cancel processing
+      if (e.key === 'Escape') {
+        if (isProcessing && !isCancelling) {
+          cancelProcessing();
+        }
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyPress);
+    return () => window.removeEventListener('keydown', handleKeyPress);
+  }, [videoFile, isProcessing, isSuggestingSettings, processedVideoUrl, isCancelling, handleProcessVideo, cancelProcessing]);
+  
   // Effect to check browser compatibility on mount
   useEffect(() => {
     const checkBrowserCompatibility = () => {
@@ -145,6 +192,18 @@ const App: React.FC = () => {
     setProcessedVideoUrl(null); 
     setGeminiError(null); // Clear AI error on new file
     setFileError(null); // Clear file error on successful selection
+    setVideoDuration(undefined); // Reset duration
+    
+    // Get video duration
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      if (isFinite(video.duration)) {
+        setVideoDuration(video.duration);
+      }
+      URL.revokeObjectURL(video.src);
+    };
+    video.src = URL.createObjectURL(file);
   };
   
   const handleFileError = (error: string) => {
@@ -326,16 +385,24 @@ Based on the user's request, provide the JSON settings object as instructed.`;
                   <p>Loading preview data...</p>
                 </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Original</h4>
-                    <VideoPlayer src={previewUrl} settings={DEFAULT_VIDEO_SETTINGS} isOriginal={true} />
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Original</h4>
+                      <VideoPlayer src={previewUrl} settings={DEFAULT_VIDEO_SETTINGS} isOriginal={true} />
+                    </div>
+                    <div>
+                      <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Modified Preview</h4>
+                      <VideoPlayer src={previewUrl} settings={debouncedSettingsForPreview} />
+                    </div>
                   </div>
-                  <div>
-                    <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Modified Preview</h4>
-                    <VideoPlayer src={previewUrl} settings={debouncedSettingsForPreview} />
-                  </div>
-                </div>
+                  <VideoInfo 
+                    fileName={videoFile.name}
+                    fileSize={videoFile.size}
+                    fileType={videoFile.type}
+                    duration={videoDuration}
+                  />
+                </>
               )}
              <button
                 onClick={handleUploadDifferent}
@@ -379,9 +446,18 @@ Based on the user's request, provide the JSON settings object as instructed.`;
                 )}
               </button>
               {isProcessing && (
-                 <div className="w-full bg-gray-700 rounded-full h-2.5 mt-3">
-                    <div className="bg-indigo-500 h-2.5 rounded-full" style={{ width: `${progress}%` }}></div>
-                </div>
+                <>
+                  <div className="w-full bg-gray-700 rounded-full h-2.5 mt-3">
+                    <div className="bg-indigo-500 h-2.5 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}></div>
+                  </div>
+                  <button
+                    onClick={cancelProcessing}
+                    disabled={isCancelling}
+                    className="w-full mt-3 px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isCancelling ? 'Cancelling...' : 'Cancel Processing'}
+                  </button>
+                </>
               )}
             </div>
           )}
@@ -413,7 +489,35 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       <footer className="w-full max-w-5xl mt-12 text-center text-gray-500 text-sm">
         <p>&copy; {new Date().getFullYear()} {APP_TITLE}. For educational and creative purposes.</p>
         <p className="mt-1">Note: Output video is in WEBM format. Ensure your target platform supports WEBM or convert it if necessary. AI suggestions provided by Gemini.</p>
-         {!ai && <p className="text-yellow-400 mt-1">AI features disabled: API_KEY for Gemini not configured.</p>}
+        {!ai && <p className="text-yellow-400 mt-1">AI features disabled: API_KEY for Gemini not configured.</p>}
+        <details className="mt-4 text-left inline-block">
+          <summary className="cursor-pointer text-gray-400 hover:text-indigo-400 transition-colors">
+            ⌨️ Keyboard Shortcuts
+          </summary>
+          <div className="mt-2 p-4 bg-gray-800 rounded-lg text-left">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div className="flex justify-between items-center gap-4">
+                <span className="text-gray-400">Upload Video:</span>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Ctrl+U</kbd>
+              </div>
+              <div className="flex justify-between items-center gap-4">
+                <span className="text-gray-400">Process Video:</span>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Ctrl+P</kbd>
+              </div>
+              <div className="flex justify-between items-center gap-4">
+                <span className="text-gray-400">Download:</span>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Ctrl+D</kbd>
+              </div>
+              <div className="flex justify-between items-center gap-4">
+                <span className="text-gray-400">Cancel:</span>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Esc</kbd>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mt-3">
+              * Use <kbd className="px-1 py-0.5 bg-gray-700 rounded text-xs">Cmd</kbd> instead of <kbd className="px-1 py-0.5 bg-gray-700 rounded text-xs">Ctrl</kbd> on Mac
+            </p>
+          </div>
+        </details>
       </footer>
     </div>
   );

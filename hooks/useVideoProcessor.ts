@@ -11,6 +11,7 @@ export function useVideoProcessor() {
   const [internalProcessedVideoUrl, setInternalProcessedVideoUrl] = useState<string | null>(null);
   const [processingError, setProcessingError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
+  const [isCancelling, setIsCancelling] = useState(false);
 
   const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -72,6 +73,16 @@ export function useVideoProcessor() {
     setInternalProcessedVideoUrl(url);
   };
 
+  const cancelProcessing = useCallback(async () => {
+    if (!isProcessing) return;
+    
+    setIsCancelling(true);
+    setProcessingError('Processing cancelled by user');
+    await cleanup();
+    setIsProcessing(false);
+    setProgress(0);
+    setIsCancelling(false);
+  }, [isProcessing, cleanup]);
 
   const processVideo = useCallback(async (videoFile: File, settings: VideoSettings): Promise<string | null> => {
     setIsProcessing(true);
@@ -357,5 +368,14 @@ export function useVideoProcessor() {
     }); 
   }, [cleanup]); 
 
-  return { processVideo, isProcessing, processedVideoUrl: internalProcessedVideoUrl, processingError, progress, setProcessedVideoUrl };
+  return { 
+    processVideo, 
+    cancelProcessing,
+    isProcessing, 
+    isCancelling,
+    processedVideoUrl: internalProcessedVideoUrl, 
+    processingError, 
+    progress, 
+    setProcessedVideoUrl 
+  };
 }
