@@ -11,6 +11,7 @@ export function useVideoProcessor() {
   const [internalProcessedVideoUrl, setInternalProcessedVideoUrl] = useState<string | null>(null);
   const [processingError, setProcessingError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
+  const [isCancelling, setIsCancelling] = useState(false);
 
   const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -23,7 +24,7 @@ export function useVideoProcessor() {
   const rotationAngle1Ref = useRef<number>(0); // For the line starting horizontally
   const rotationAngle2Ref = useRef<number>(Math.PI / 2); // For the line starting vertically
 
-  const cleanup = useCallback(() => {
+  const cleanup = useCallback(async () => {
     if (animationFrameIdRef.current) {
         cancelAnimationFrame(animationFrameIdRef.current);
         animationFrameIdRef.current = 0;
@@ -44,7 +45,11 @@ export function useVideoProcessor() {
         canvasRef.current = null;
     }
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close().catch(console.error);
+        try {
+            await audioContextRef.current.close();
+        } catch (e) {
+            console.error('Error closing AudioContext:', e);
+        }
         audioContextRef.current = null;
     }
   }, []);
@@ -68,13 +73,29 @@ export function useVideoProcessor() {
     setInternalProcessedVideoUrl(url);
   };
 
+  const cancelProcessing = useCallback(async () => {
+    if (!isProcessing) return;
+    
+    setIsCancelling(true);
+    setProcessingError('Processing cancelled by user');
+    await cleanup();
+    setIsProcessing(false);
+    setProgress(0);
+    setIsCancelling(false);
+  }, [isProcessing, cleanup]);
 
   const processVideo = useCallback(async (videoFile: File, settings: VideoSettings): Promise<string | null> => {
     setIsProcessing(true);
+    
+    // Revoke previous processed video URL to prevent memory leak
+    if (internalProcessedVideoUrl) {
+      URL.revokeObjectURL(internalProcessedVideoUrl);
+    }
     setProcessedVideoUrl(null); 
+    
     setProcessingError(null);
     setProgress(0);
-    cleanup(); 
+    await cleanup(); // Await cleanup to ensure AudioContext is properly closed
 
     // Reset rotating lines angles
     rotationAngle1Ref.current = 0;
@@ -93,7 +114,7 @@ export function useVideoProcessor() {
         const err = 'Could not get canvas context.';
         setProcessingError(err);
         setIsProcessing(false);
-        cleanup();
+        cleanup().catch(console.error);
         reject(new Error(err));
         return;
       }
@@ -104,13 +125,23 @@ export function useVideoProcessor() {
         const err = 'AudioContext not supported.';
         setProcessingError(err);
         setIsProcessing(false);
-        cleanup();
+        cleanup().catch(console.error);
         reject(new Error(err));
         return;
       }
       const audioContext = audioContextRef.current;
       
       video.onloadedmetadata = async () => {
+        // Validate video has valid dimensions
+        if (!video.videoWidth || !video.videoHeight) {
+          const err = 'Invalid video: Video has no dimensions (width or height is 0). The file may be corrupted or audio-only.';
+          setProcessingError(err);
+          setIsProcessing(false);
+          cleanup().catch(console.error);
+          reject(new Error(err));
+          return;
+        }
+        
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         
@@ -153,7 +184,7 @@ export function useVideoProcessor() {
             console.error(err);
             setProcessingError(err);
             setIsProcessing(false);
-            cleanup();
+            cleanup().catch(console.error);
             reject(new Error(err));
             return;
         }
@@ -165,7 +196,7 @@ export function useVideoProcessor() {
             console.error(err, e);
             setProcessingError(err);
             setIsProcessing(false);
-            cleanup();
+            cleanup().catch(console.error);
             reject(new Error(err));
             return;
         }
@@ -210,11 +241,16 @@ export function useVideoProcessor() {
             console.error(errorMessageText, event); // Log original event for full details
             setProcessingError(errorMessageText); // Update UI with the formatted error message
             setIsProcessing(false);
-            cleanup();
+            cleanup().catch(console.error);
             reject(errorToReject); // Reject promise with an actual Error object
         };
         
         const rotationIncrementPerFrame = (2 * Math.PI) / (ROTATION_DURATION_SECONDS * FPS);
+        
+        // Pre-calculate pixel noise count to avoid recalculating on every frame (performance optimization)
+        const numNoisePixels = settings.enablePixelNoise 
+          ? Math.floor((canvas.width * canvas.height) * 0.001)
+          : 0;
 
         const drawFrame = () => {
           if (!sourceVideoRef.current || sourceVideoRef.current.paused || sourceVideoRef.current.ended || !canvasRef.current || !ctx) {
@@ -237,7 +273,6 @@ export function useVideoProcessor() {
 
           if (settings.enablePixelNoise && canvasRef.current) {
             const currentCanvas = canvasRef.current;
-            const numNoisePixels = Math.floor((currentCanvas.width * currentCanvas.height) * 0.001); 
             for (let i = 0; i < numNoisePixels; i++) {
                 const x = Math.random() * currentCanvas.width;
                 const y = Math.random() * currentCanvas.height;
@@ -283,8 +318,11 @@ export function useVideoProcessor() {
             ctx.restore();
           }
 
-          if (sourceVideoRef.current.duration > 0) {
-             setProgress(Math.min(100, Math.round((sourceVideoRef.current.currentTime / sourceVideoRef.current.duration) * 100)));
+          if (sourceVideoRef.current.duration > 0 && isFinite(sourceVideoRef.current.duration)) {
+             const progressValue = (sourceVideoRef.current.currentTime / sourceVideoRef.current.duration) * 100;
+             if (isFinite(progressValue)) {
+               setProgress(Math.min(100, Math.round(progressValue)));
+             }
           }
           animationFrameIdRef.current = requestAnimationFrame(drawFrame);
         };
@@ -304,17 +342,6 @@ export function useVideoProcessor() {
            animationFrameIdRef.current = 0;
         };
 
-        video.onerror = (e) => { 
-            const errorMsg = (video.error?.message || 'Unknown video playback error');
-            const err = `Error playing source video: ${errorMsg}`;
-            console.error(err, e);
-            setProcessingError(err);
-            setIsProcessing(false);
-            if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
-            cleanup();
-            reject(new Error(err));
-        };
-
         mediaRecorder.start();
         video.play().catch(err => {
             const errorMsg = `Could not start video playback: ${err.message}`;
@@ -322,7 +349,7 @@ export function useVideoProcessor() {
             setProcessingError(errorMsg);
             setIsProcessing(false);
             if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
-            cleanup();
+            cleanup().catch(console.error);
             reject(err);
         });
       };
@@ -333,7 +360,7 @@ export function useVideoProcessor() {
         console.error(err, e);
         setProcessingError(err);
         setIsProcessing(false);
-        cleanup();
+        cleanup().catch(console.error);
         reject(new Error(err));
       };
       
@@ -341,5 +368,14 @@ export function useVideoProcessor() {
     }); 
   }, [cleanup]); 
 
-  return { processVideo, isProcessing, processedVideoUrl: internalProcessedVideoUrl, processingError, progress, setProcessedVideoUrl };
+  return { 
+    processVideo, 
+    cancelProcessing,
+    isProcessing, 
+    isCancelling,
+    processedVideoUrl: internalProcessedVideoUrl, 
+    processingError, 
+    progress, 
+    setProcessedVideoUrl 
+  };
 }

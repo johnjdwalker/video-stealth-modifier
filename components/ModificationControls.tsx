@@ -1,7 +1,7 @@
 
-import React from 'react';
+import React, { useState } from 'react';
 import { VideoSettings } from '../types';
-import { DEFAULT_VIDEO_SETTINGS } from '../constants';
+import { DEFAULT_VIDEO_SETTINGS, SETTINGS_PRESETS, PRESET_DESCRIPTIONS } from '../constants';
 import SliderControl from './SliderControl';
 import ResetIcon from './icons/ResetIcon';
 import ProcessingSpinnerIcon from './icons/ProcessingSpinnerIcon'; // For AI suggestion loading
@@ -29,6 +29,7 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
   geminiError,
   aiAvailable
  }) => {
+  const [showPresets, setShowPresets] = useState(false);
   
   const handleSliderChange = (key: keyof Omit<VideoSettings, 'flipHorizontal' | 'enableRotatingLines' | 'enablePixelNoise' | 'audioPreservesPitch'>, value: number) => {
     onSettingsChange({ ...settings, [key]: value });
@@ -40,6 +41,11 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
 
   const handleReset = () => {
     onSettingsChange(DEFAULT_VIDEO_SETTINGS);
+  };
+  
+  const handlePresetSelect = (presetName: string) => {
+    onSettingsChange(SETTINGS_PRESETS[presetName]);
+    setShowPresets(false);
   };
 
   const commonDisabledState = disabled || isSuggestingSettings;
@@ -81,17 +87,49 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
         </div>
       )}
 
-      <div className="flex justify-between items-center mb-6">
-        <h3 className="text-xl font-semibold text-gray-100">Manual Adjustments</h3>
-        <button
-            onClick={handleReset}
-            disabled={commonDisabledState}
-            className="p-2 rounded-md text-gray-400 hover:bg-gray-700 hover:text-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50"
-            title="Reset to defaults"
-            aria-label="Reset all adjustments to default values"
-        >
-            <ResetIcon className="w-5 h-5"/>
-        </button>
+      <div className="mb-6">
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="text-xl font-semibold text-gray-100">Manual Adjustments</h3>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowPresets(!showPresets)}
+              disabled={commonDisabledState}
+              className="px-3 py-1.5 text-sm rounded-md bg-purple-600 hover:bg-purple-700 text-white font-medium transition-colors disabled:opacity-50"
+              title="Quick presets"
+            >
+              Presets
+            </button>
+            <button
+              onClick={handleReset}
+              disabled={commonDisabledState}
+              className="p-2 rounded-md text-gray-400 hover:bg-gray-700 hover:text-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50"
+              title="Reset to defaults"
+              aria-label="Reset all adjustments to default values"
+            >
+              <ResetIcon className="w-5 h-5"/>
+            </button>
+          </div>
+        </div>
+        
+        {showPresets && (
+          <div className="mb-4 p-3 bg-gray-900 rounded-lg border border-gray-700">
+            <p className="text-xs text-gray-400 mb-2">Quick Presets:</p>
+            <div className="grid grid-cols-2 gap-2">
+              {Object.keys(SETTINGS_PRESETS).map((presetName) => (
+                <button
+                  key={presetName}
+                  onClick={() => handlePresetSelect(presetName)}
+                  disabled={commonDisabledState}
+                  className="px-3 py-2 text-sm bg-gray-800 hover:bg-indigo-600 text-gray-300 hover:text-white rounded-md transition-colors disabled:opacity-50 text-left"
+                  title={PRESET_DESCRIPTIONS[presetName]}
+                >
+                  <div className="font-medium capitalize">{presetName}</div>
+                  <div className="text-xs text-gray-500 line-clamp-1">{PRESET_DESCRIPTIONS[presetName]}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
       
       <SliderControl

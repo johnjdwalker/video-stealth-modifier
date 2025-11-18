@@ -1,18 +1,39 @@
 
 import React, { useRef } from 'react';
 import UploadIcon from './icons/UploadIcon';
+import { MAX_FILE_SIZE, MAX_FILE_SIZE_MB, ALLOWED_VIDEO_TYPES } from '../constants';
 
 interface VideoUploaderProps {
   onFileSelect: (file: File) => void;
+  onFileError: (error: string) => void;
   disabled?: boolean;
 }
 
-const VideoUploader: React.FC<VideoUploaderProps> = ({ onFileSelect, disabled }) => {
+const VideoUploader: React.FC<VideoUploaderProps> = ({ onFileSelect, onFileError, disabled }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files[0]) {
-      onFileSelect(event.target.files[0]);
+      const file = event.target.files[0];
+      
+      // Validate file size
+      if (file.size > MAX_FILE_SIZE) {
+        const sizeMB = (file.size / (1024 * 1024)).toFixed(2);
+        onFileError(`File is too large (${sizeMB}MB). Maximum allowed size is ${MAX_FILE_SIZE_MB}MB. Please choose a smaller video file.`);
+        event.target.value = '';
+        return;
+      }
+      
+      // Validate file type
+      if (!ALLOWED_VIDEO_TYPES.includes(file.type as any) && !file.type.startsWith('video/')) {
+        onFileError(`Invalid file type: ${file.type || 'unknown'}. Please upload a valid video file (MP4, WEBM, MOV, etc.).`);
+        event.target.value = '';
+        return;
+      }
+      
+      onFileSelect(file);
+      // Reset input value to allow selecting the same file again
+      event.target.value = '';
     }
   };
 
