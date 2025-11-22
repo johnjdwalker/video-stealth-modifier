@@ -7,6 +7,7 @@ import VideoUploader from './components/VideoUploader';
 import VideoPlayer from './components/VideoPlayer';
 import ModificationControls from './components/ModificationControls';
 import VideoInfo from './components/VideoInfo';
+import WatermarkRemover from './components/WatermarkRemover';
 import { useVideoProcessor } from './hooks/useVideoProcessor';
 import DownloadIcon from './components/icons/DownloadIcon';
 import ProcessingSpinnerIcon from './components/icons/ProcessingSpinnerIcon';
@@ -25,7 +26,10 @@ try {
 }
 
 
+type FeatureMode = 'modify' | 'watermark';
+
 const App: React.FC = () => {
+  const [featureMode, setFeatureMode] = useState<FeatureMode>('modify');
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   
@@ -340,6 +344,36 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         <p className="text-gray-400 mt-2">
           Subtly modify your videos. Adjust visual properties, speed, and audio. Compare original with modified preview. Get AI suggestions!
         </p>
+        
+        {/* Feature Tabs */}
+        <div className="flex justify-center gap-4 mt-6">
+          <button
+            onClick={() => {
+              setFeatureMode('modify');
+              setVideoFile(null);
+            }}
+            className={`px-6 py-2 rounded-lg font-semibold transition-colors duration-200 ${
+              featureMode === 'modify'
+                ? 'bg-indigo-600 text-white'
+                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+            }`}
+          >
+            Video Modification
+          </button>
+          <button
+            onClick={() => {
+              setFeatureMode('watermark');
+              setVideoFile(null);
+            }}
+            className={`px-6 py-2 rounded-lg font-semibold transition-colors duration-200 ${
+              featureMode === 'watermark'
+                ? 'bg-indigo-600 text-white'
+                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+            }`}
+          >
+            Watermark Removal
+          </button>
+        </div>
       </header>
 
       {browserCompatibilityError && (
@@ -361,128 +395,134 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         </div>
       )}
 
-      <main className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-3 gap-8">
-        <div className="lg:col-span-2 space-y-6">
-          {!videoFile ? (
-            <>
-              <VideoUploader 
-                onFileSelect={handleFileSelect} 
-                onFileError={handleFileError}
-                disabled={isProcessing || isSuggestingSettings} 
-              />
-              {fileError && (
-                <div className="bg-red-700 p-4 rounded-lg text-red-100">
-                  <p className="font-semibold">File Upload Error:</p>
-                  <p className="text-sm">{fileError}</p>
-                </div>
-              )}
-            </>
-          ) : (
-            <>
-              {!previewUrl ? (
-                <div className="w-full aspect-video bg-gray-800 rounded-lg flex items-center justify-center text-gray-500" style={{minHeight: '200px'}}>
-                  <p>Loading preview data...</p>
-                </div>
+      <main className="w-full max-w-5xl">
+        {featureMode === 'watermark' ? (
+          <WatermarkRemover />
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div className="lg:col-span-2 space-y-6">
+              {!videoFile ? (
+                <>
+                  <VideoUploader 
+                    onFileSelect={handleFileSelect} 
+                    onFileError={handleFileError}
+                    disabled={isProcessing || isSuggestingSettings} 
+                  />
+                  {fileError && (
+                    <div className="bg-red-700 p-4 rounded-lg text-red-100">
+                      <p className="font-semibold">File Upload Error:</p>
+                      <p className="text-sm">{fileError}</p>
+                    </div>
+                  )}
+                </>
               ) : (
                 <>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                      <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Original</h4>
-                      <VideoPlayer src={previewUrl} settings={DEFAULT_VIDEO_SETTINGS} isOriginal={true} />
+                  {!previewUrl ? (
+                    <div className="w-full aspect-video bg-gray-800 rounded-lg flex items-center justify-center text-gray-500" style={{minHeight: '200px'}}>
+                      <p>Loading preview data...</p>
                     </div>
-                    <div>
-                      <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Modified Preview</h4>
-                      <VideoPlayer src={previewUrl} settings={debouncedSettingsForPreview} />
-                    </div>
-                  </div>
-                  <VideoInfo 
-                    fileName={videoFile.name}
-                    fileSize={videoFile.size}
-                    fileType={videoFile.type}
-                    duration={videoDuration}
-                  />
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Original</h4>
+                          <VideoPlayer src={previewUrl} settings={DEFAULT_VIDEO_SETTINGS} isOriginal={true} />
+                        </div>
+                        <div>
+                          <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Modified Preview</h4>
+                          <VideoPlayer src={previewUrl} settings={debouncedSettingsForPreview} />
+                        </div>
+                      </div>
+                      <VideoInfo 
+                        fileName={videoFile.name}
+                        fileSize={videoFile.size}
+                        fileType={videoFile.type}
+                        duration={videoDuration}
+                      />
+                    </>
+                  )}
+                 <button
+                    onClick={handleUploadDifferent}
+                    className="w-full mt-4 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200 disabled:opacity-50"
+                    disabled={isProcessing || isSuggestingSettings}
+                 >
+                    Upload Different Video
+                 </button>
                 </>
               )}
-             <button
-                onClick={handleUploadDifferent}
-                className="w-full mt-4 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200 disabled:opacity-50"
-                disabled={isProcessing || isSuggestingSettings}
-             >
-                Upload Different Video
-             </button>
-            </>
-          )}
-        </div>
+            </div>
 
-        <aside className="lg:col-span-1 space-y-6">
-          <ModificationControls 
-            settings={currentSettings} 
-            onSettingsChange={handleSettingsChange}
-            disabled={controlsDisabled}
-            geminiPrompt={geminiPrompt}
-            onGeminiPromptChange={setGeminiPrompt}
-            onSuggestSettings={handleSuggestSettings}
-            isSuggestingSettings={isSuggestingSettings}
-            geminiError={geminiError}
-            aiAvailable={!!ai}
-          />
-          
-          {videoFile && (
-            <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
-              <h3 className="text-xl font-semibold text-gray-100 mb-4">Process & Download</h3>
-              <button
-                onClick={handleProcessVideo}
-                disabled={controlsDisabled || isProcessing} // Double ensure processing takes precedence
-                className="w-full px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {isProcessing ? (
-                  <>
-                    <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
-                    Processing... ({progress}%)
-                  </>
-                ) : (
-                  "Apply Modifications & Prepare Download"
-                )}
-              </button>
-              {isProcessing && (
-                <>
-                  <div className="w-full bg-gray-700 rounded-full h-2.5 mt-3">
-                    <div className="bg-indigo-500 h-2.5 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}></div>
-                  </div>
+            <aside className="lg:col-span-1 space-y-6">
+              <ModificationControls 
+                settings={currentSettings} 
+                onSettingsChange={handleSettingsChange}
+                disabled={controlsDisabled}
+                geminiPrompt={geminiPrompt}
+                onGeminiPromptChange={setGeminiPrompt}
+                onSuggestSettings={handleSuggestSettings}
+                isSuggestingSettings={isSuggestingSettings}
+                geminiError={geminiError}
+                aiAvailable={!!ai}
+              />
+              
+              {videoFile && (
+                <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
+                  <h3 className="text-xl font-semibold text-gray-100 mb-4">Process & Download</h3>
                   <button
-                    onClick={cancelProcessing}
-                    disabled={isCancelling}
-                    className="w-full mt-3 px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={handleProcessVideo}
+                    disabled={controlsDisabled || isProcessing} // Double ensure processing takes precedence
+                    className="w-full px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    {isCancelling ? 'Cancelling...' : 'Cancel Processing'}
+                    {isProcessing ? (
+                      <>
+                        <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
+                        Processing... ({progress}%)
+                      </>
+                    ) : (
+                      "Apply Modifications & Prepare Download"
+                    )}
                   </button>
-                </>
+                  {isProcessing && (
+                    <>
+                      <div className="w-full bg-gray-700 rounded-full h-2.5 mt-3">
+                        <div className="bg-indigo-500 h-2.5 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}></div>
+                      </div>
+                      <button
+                        onClick={cancelProcessing}
+                        disabled={isCancelling}
+                        className="w-full mt-3 px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isCancelling ? 'Cancelling...' : 'Cancel Processing'}
+                      </button>
+                    </>
+                  )}
+                </div>
               )}
-            </div>
-          )}
 
-          {processingError && !isProcessing && ( // Show processingError only if not currently processing
-            <div className="bg-red-700 p-4 rounded-lg text-red-100">
-              <p className="font-semibold">Video Processing Error:</p>
-              <p className="text-sm">{processingError}</p>
-            </div>
-          )}
+              {processingError && !isProcessing && ( // Show processingError only if not currently processing
+                <div className="bg-red-700 p-4 rounded-lg text-red-100">
+                  <p className="font-semibold">Video Processing Error:</p>
+                  <p className="text-sm">{processingError}</p>
+                </div>
+              )}
 
-          {processedVideoUrl && !isProcessing && (
-            <div className="bg-green-700 p-6 rounded-lg shadow-lg">
-              <h3 className="text-xl font-semibold text-green-100 mb-3">Download Ready!</h3>
-              <p className="text-sm text-green-200 mb-3">Your modified video is ready (WEBM format).</p>
-              <a
-                href={processedVideoUrl}
-                download={`modified_${videoFile?.name.replace(/\.[^.]+$/, '') || 'video'}.webm`}
-                className="w-full px-6 py-3 bg-green-500 hover:bg-green-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200"
-              >
-                <DownloadIcon className="w-5 h-5 mr-2" />
-                Download Modified Video
-              </a>
-            </div>
-          )}
-        </aside>
+              {processedVideoUrl && !isProcessing && (
+                <div className="bg-green-700 p-6 rounded-lg shadow-lg">
+                  <h3 className="text-xl font-semibold text-green-100 mb-3">Download Ready!</h3>
+                  <p className="text-sm text-green-200 mb-3">Your modified video is ready (WEBM format).</p>
+                  <a
+                    href={processedVideoUrl}
+                    download={`modified_${videoFile?.name.replace(/\.[^.]+$/, '') || 'video'}.webm`}
+                    className="w-full px-6 py-3 bg-green-500 hover:bg-green-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200"
+                  >
+                    <DownloadIcon className="w-5 h-5 mr-2" />
+                    Download Modified Video
+                  </a>
+                </div>
+              )}
+            </aside>
+          </div>
+        )}
       </main>
       
       <footer className="w-full max-w-5xl mt-12 text-center text-gray-500 text-sm">

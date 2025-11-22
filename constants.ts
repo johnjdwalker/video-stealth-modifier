@@ -96,3 +96,12 @@ export const PRESET_DESCRIPTIONS: Record<string, string> = {
   cinematic: 'Film-like quality with reduced saturation and slower pace',
   energetic: 'Vibrant colors, faster speed, and dynamic effects',
 };
+
+// Watermark detection constants
+export const WATERMARK_DETECTION_SAMPLE_COUNT = 5; // Minimum frames to sample
+export const WATERMARK_DETECTION_SAMPLE_INTERVAL_SECONDS = 2; // Sample every 2 seconds
+export const WATERMARK_CORNER_REGION_PERCENTAGE = 0.15; // Check 15% of width/height in corners
+export const WATERMARK_VARIANCE_THRESHOLD = 500; // Lower variance suggests watermark
+export const WATERMARK_VARIANCE_STD_THRESHOLD = 200; // Standard deviation threshold
+export const WATERMARK_INPAINT_RADIUS = 8; // Pixels to sample for inpainting
+export const WATERMARK_INPAINT_PADDING = 5; // Padding around watermark region
