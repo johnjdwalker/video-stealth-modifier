@@ -4,13 +4,19 @@ A web application for subtly modifying videos with AI-powered suggestions. Adjus
 
 ## Features
 
-- 🎨 **Visual Adjustments**: Brightness, contrast, saturation controls
-- ⚡ **Playback Speed**: Adjust video speed (0.5x - 2.0x) with pitch preservation
-- 🔊 **Audio Control**: Volume adjustment and pitch preservation options
+- 🎨 **Visual Adjustments**: Brightness, contrast, saturation, hue rotation
+- 🖼️ **Stylistic Filters**: Blur, sepia, grayscale, vignette
+- ⚡ **Playback Speed**: Adjust video speed (0.5x - 2.0x) with optional pitch preservation
+- 🔊 **Audio Control**: Volume, audio fade-in/fade-out
+- ✂️ **Trim**: Choose start and end times to keep a portion of the video
 - 🔄 **Effects**: Horizontal flip, rotating lines, pixel noise
+- 🎛️ **Presets**: Built-in (subtle, vintage, dramatic, cinematic, energetic, noir, dreamy)
+  and your own user-defined presets saved to localStorage
 - 🤖 **AI Suggestions**: Get AI-powered settings recommendations via Gemini
 - 👀 **Live Preview**: Side-by-side comparison of original vs modified video
-- 💾 **Export**: Download modified videos in WEBM format
+- 📥 **Easy Upload**: Click, drag-and-drop, or paste a video from the clipboard
+- 💾 **Export**: Download modified videos in WEBM (VP8 / VP9) — or MP4 (H.264) on
+  browsers that allow it — with selectable bitrate
 
 ## Browser Requirements
 
@@ -65,18 +71,35 @@ This app requires a modern browser with support for:
 
 ## Usage
 
-1. **Upload Video**: Click to upload a video file (max 500MB)
-2. **Adjust Settings**: Use sliders and toggles to modify video properties
-3. **Preview Changes**: View original and modified video side-by-side
-4. **AI Suggestions** (Optional): Describe desired changes and get AI recommendations
-5. **Process Video**: Apply modifications and prepare for download
-6. **Download**: Save the modified video to your device
+1. **Upload Video**: Click, drag-and-drop, or paste a video from the clipboard
+   (max 500MB)
+2. **Adjust Settings**: Use sliders and toggles to tune visuals, audio, effects,
+   trim, and output format
+3. **Apply a preset**: Click *Presets* to apply a built-in look or save the
+   current configuration as your own preset
+4. **Preview Changes**: View original and modified video side-by-side
+5. **AI Suggestions** (Optional): Describe desired changes and get AI recommendations
+6. **Process Video**: Apply modifications and prepare for download
+7. **Download**: Save the modified video to your device
+
+### Keyboard Shortcuts
+
+| Action          | Shortcut             |
+| --------------- | -------------------- |
+| Upload video    | `Ctrl/Cmd + U`       |
+| Process video   | `Ctrl/Cmd + P`       |
+| Download result | `Ctrl/Cmd + D`       |
+| Cancel          | `Esc`                |
 
 ## File Limitations
 
 - **Maximum file size**: 500MB
-- **Supported formats**: MP4, WEBM, MOV, AVI, MKV, OGG
-- **Output format**: WEBM (VP8 video codec, Opus audio codec)
+- **Supported input formats**: MP4, WEBM, MOV, AVI, MKV, OGG
+- **Output formats**:
+  - WEBM (VP8 + Opus) — works in all supported browsers
+  - WEBM (VP9 + Opus) — Chrome / Firefox / Edge
+  - MP4 (H.264 + AAC) — only when the browser's `MediaRecorder` allows it
+    (e.g. recent Safari builds). The selector disables unsupported entries.
 
 ## Troubleshooting
 

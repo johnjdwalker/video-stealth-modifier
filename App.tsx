@@ -2,7 +2,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { VideoSettings } from './types';
-import { DEFAULT_VIDEO_SETTINGS, APP_TITLE } from './constants';
+import {
+  DEFAULT_VIDEO_SETTINGS,
+  APP_TITLE,
+  SETTINGS_STORAGE_KEY,
+  SETTINGS_RANGES,
+  OUTPUT_FORMAT_EXTENSIONS,
+} from './constants';
 import VideoUploader from './components/VideoUploader';
 import VideoPlayer from './components/VideoPlayer';
 import ModificationControls from './components/ModificationControls';
@@ -35,7 +41,7 @@ const App: React.FC = () => {
   
   const [currentSettings, setCurrentSettings] = useState<VideoSettings>(() => {
     try {
-      const savedSettings = localStorage.getItem('videoStealthModifierSettings');
+      const savedSettings = localStorage.getItem(SETTINGS_STORAGE_KEY);
       if (savedSettings) {
         const parsed = JSON.parse(savedSettings);
         return { ...DEFAULT_VIDEO_SETTINGS, ...parsed };
@@ -49,15 +55,16 @@ const App: React.FC = () => {
 
   const [debouncedSettingsForPreview, setDebouncedSettingsForPreview] = useState<VideoSettings>(currentSettings);
   
-  const { 
-    processVideo, 
+  const {
+    processVideo,
     cancelProcessing,
     isProcessing,
     isCancelling,
-    processedVideoUrl, 
-    processingError, 
+    processedVideoUrl,
+    processedMimeType,
+    processingError,
     progress,
-    setProcessedVideoUrl
+    setProcessedVideoUrl,
   } = useVideoProcessor();
 
   const [geminiPrompt, setGeminiPrompt] = useState<string>("");
@@ -163,7 +170,7 @@ const App: React.FC = () => {
   // Effect to save settings to localStorage
   useEffect(() => {
     try {
-      localStorage.setItem('videoStealthModifierSettings', JSON.stringify(currentSettings));
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(currentSettings));
     } catch (error) {
       console.error("Failed to save settings to localStorage:", error);
     }
@@ -254,17 +261,24 @@ const App: React.FC = () => {
 Return your suggestions *only* as a JSON object. Do not include any explanatory text before or after the JSON object.
 The JSON object must strictly adhere to the following structure and data types. All fields are required:
 {
-  "brightness": number, /* Example: 100. Range: 0-200. */
-  "contrast": number, /* Example: 100. Range: 0-200. */
-  "saturation": number, /* Example: 100. Range: 0-200. */
-  "playbackSpeed": number, /* Example: 1.0. Range: 0.5-2.0. */
-  "volume": number, /* Example: 100. Range: 0-100. */
-  "flipHorizontal": boolean, /* Example: false. */
-  "enableRotatingLines": boolean, /* Example: false. */
-  "enablePixelNoise": boolean, /* Example: false. */
-  "audioPreservesPitch": boolean /* Example: true. */
+  "brightness": number,            /* Range: 0-200, 100 = unchanged. */
+  "contrast": number,              /* Range: 0-200, 100 = unchanged. */
+  "saturation": number,            /* Range: 0-200, 100 = unchanged. */
+  "hueRotate": number,             /* Range: -180 to 180 degrees. 0 = unchanged. */
+  "blur": number,                  /* Range: 0-10 pixels. 0 = none. */
+  "sepia": number,                 /* Range: 0-100. 0 = none. */
+  "grayscale": number,             /* Range: 0-100. 0 = none. */
+  "vignette": number,              /* Range: 0-100. 0 = none. */
+  "playbackSpeed": number,         /* Range: 0.5-2.0. 1.0 = unchanged. */
+  "volume": number,                /* Range: 0-100. 100 = unchanged. */
+  "audioFadeInSeconds": number,    /* Range: 0-10 seconds. */
+  "audioFadeOutSeconds": number,   /* Range: 0-10 seconds. */
+  "flipHorizontal": boolean,
+  "enableRotatingLines": boolean,
+  "enablePixelNoise": boolean,
+  "audioPreservesPitch": boolean
 }
-Focus on subtle changes suitable for making a video distinct without being overly dramatic.`;
+Focus on subtle changes suitable for making a video distinct without being overly dramatic. Avoid combining many heavy effects at once.`;
 
     const userRequestPrompt = `User request: "${geminiPrompt.trim()}"
 
@@ -288,43 +302,44 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       }
 
       const suggested = JSON.parse(jsonStr);
-      
-      // Validate and apply settings
-      const newSettings: VideoSettings = { ...DEFAULT_VIDEO_SETTINGS }; // Start with defaults
-      let allFieldsValid = true;
 
-      // Define min/max for clamping
-      const ranges: Record<keyof Pick<VideoSettings, 'brightness'|'contrast'|'saturation'|'playbackSpeed'|'volume'>, {min: number, max: number}> = {
-          brightness: {min: 0, max: 200},
-          contrast: {min: 0, max: 200},
-          saturation: {min: 0, max: 200},
-          playbackSpeed: {min: 0.5, max: 2.0},
-          volume: {min: 0, max: 100},
-      };
+      // Start from current settings so we keep things the AI doesn't address
+      // (e.g. trim window, output format) and only override the fields it returns.
+      const newSettings: VideoSettings = { ...currentSettings };
+      const aiAddressableKeys: Array<keyof VideoSettings> = [
+        'brightness', 'contrast', 'saturation', 'hueRotate',
+        'blur', 'sepia', 'grayscale', 'vignette',
+        'playbackSpeed', 'volume',
+        'audioFadeInSeconds', 'audioFadeOutSeconds',
+        'flipHorizontal', 'enableRotatingLines', 'enablePixelNoise', 'audioPreservesPitch',
+      ];
+      let invalidFieldCount = 0;
 
-      (Object.keys(DEFAULT_VIDEO_SETTINGS) as Array<keyof VideoSettings>).forEach(key => {
-        if (suggested.hasOwnProperty(key)) {
-          const suggestedValue = suggested[key];
-          if (typeof suggestedValue === typeof DEFAULT_VIDEO_SETTINGS[key]) {
-            if (typeof suggestedValue === 'number' && ranges[key as keyof typeof ranges]) {
-              const range = ranges[key as keyof typeof ranges];
-              (newSettings[key] as number) = Math.max(range.min, Math.min(range.max, suggestedValue));
-            } else {
-              (newSettings[key] as any) = suggestedValue;
-            }
-          } else {
-            console.warn(`AI suggestion for '${key}' has mismatched type. Expected ${typeof DEFAULT_VIDEO_SETTINGS[key]}, got ${typeof suggestedValue}. Using default.`);
-            allFieldsValid = false; // Or keep default from newSettings initialization
-          }
+      aiAddressableKeys.forEach((key) => {
+        if (!Object.prototype.hasOwnProperty.call(suggested, key)) {
+          invalidFieldCount += 1;
+          return;
+        }
+        const suggestedValue = suggested[key];
+        const defaultValue = DEFAULT_VIDEO_SETTINGS[key];
+        if (typeof suggestedValue !== typeof defaultValue) {
+          invalidFieldCount += 1;
+          return;
+        }
+        if (typeof suggestedValue === 'number') {
+          const range = (SETTINGS_RANGES as Record<string, { min: number; max: number }>)[key as string];
+          const clamped = range
+            ? Math.max(range.min, Math.min(range.max, suggestedValue))
+            : suggestedValue;
+          (newSettings[key] as number) = clamped;
         } else {
-          console.warn(`AI suggestion missing field '${key}'. Using default.`);
-          allFieldsValid = false; // Or keep default
+          (newSettings[key] as any) = suggestedValue;
         }
       });
-      
+
       setCurrentSettings(newSettings);
-      if (!allFieldsValid) {
-        setGeminiError("AI suggestion was partially applied. Some fields were missing or invalid and set to defaults.");
+      if (invalidFieldCount > 0) {
+        setGeminiError(`AI suggestion was partially applied (${invalidFieldCount} field${invalidFieldCount === 1 ? '' : 's'} missing or invalid).`);
       }
 
     } catch (e: any) {
@@ -453,8 +468,8 @@ Based on the user's request, provide the JSON settings object as instructed.`;
             </div>
 
             <aside className="lg:col-span-1 space-y-6">
-              <ModificationControls 
-                settings={currentSettings} 
+              <ModificationControls
+                settings={currentSettings}
                 onSettingsChange={handleSettingsChange}
                 disabled={controlsDisabled}
                 geminiPrompt={geminiPrompt}
@@ -463,6 +478,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
                 isSuggestingSettings={isSuggestingSettings}
                 geminiError={geminiError}
                 aiAvailable={!!ai}
+                videoDuration={videoDuration}
               />
               
               {videoFile && (
@@ -506,20 +522,28 @@ Based on the user's request, provide the JSON settings object as instructed.`;
                 </div>
               )}
 
-              {processedVideoUrl && !isProcessing && (
-                <div className="bg-green-700 p-6 rounded-lg shadow-lg">
-                  <h3 className="text-xl font-semibold text-green-100 mb-3">Download Ready!</h3>
-                  <p className="text-sm text-green-200 mb-3">Your modified video is ready (WEBM format).</p>
-                  <a
-                    href={processedVideoUrl}
-                    download={`modified_${videoFile?.name.replace(/\.[^.]+$/, '') || 'video'}.webm`}
-                    className="w-full px-6 py-3 bg-green-500 hover:bg-green-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200"
-                  >
-                    <DownloadIcon className="w-5 h-5 mr-2" />
-                    Download Modified Video
-                  </a>
-                </div>
-              )}
+              {processedVideoUrl && !isProcessing && (() => {
+                const ext = (processedMimeType && processedMimeType.includes('mp4'))
+                  ? 'mp4'
+                  : OUTPUT_FORMAT_EXTENSIONS[currentSettings.outputFormat] || 'webm';
+                const baseName = videoFile?.name.replace(/\.[^.]+$/, '') || 'video';
+                return (
+                  <div className="bg-green-700 p-6 rounded-lg shadow-lg">
+                    <h3 className="text-xl font-semibold text-green-100 mb-3">Download Ready!</h3>
+                    <p className="text-sm text-green-200 mb-3">
+                      Your modified video is ready ({ext.toUpperCase()} format).
+                    </p>
+                    <a
+                      href={processedVideoUrl}
+                      download={`modified_${baseName}.${ext}`}
+                      className="w-full px-6 py-3 bg-green-500 hover:bg-green-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200"
+                    >
+                      <DownloadIcon className="w-5 h-5 mr-2" />
+                      Download Modified Video
+                    </a>
+                  </div>
+                );
+              })()}
             </aside>
           </div>
         )}
@@ -527,7 +551,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       
       <footer className="w-full max-w-5xl mt-12 text-center text-gray-500 text-sm">
         <p>&copy; {new Date().getFullYear()} {APP_TITLE}. For educational and creative purposes.</p>
-        <p className="mt-1">Note: Output video is in WEBM format. Ensure your target platform supports WEBM or convert it if necessary. AI suggestions provided by Gemini.</p>
+        <p className="mt-1">Note: Output format depends on your browser. WEBM (VP8/VP9) is supported widely; MP4 (H.264) only on browsers that allow it for MediaRecorder. AI suggestions provided by Gemini.</p>
         {!ai && <p className="text-yellow-400 mt-1">AI features disabled: API_KEY for Gemini not configured.</p>}
         <details className="mt-4 text-left inline-block">
           <summary className="cursor-pointer text-gray-400 hover:text-indigo-400 transition-colors">
