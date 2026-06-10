@@ -14,6 +14,7 @@ import VideoPlayer from './components/VideoPlayer';
 import ModificationControls from './components/ModificationControls';
 import VideoInfo from './components/VideoInfo';
 import WatermarkRemover from './components/WatermarkRemover';
+import SoraWatermarkRemover from './components/SoraWatermarkRemover';
 import { useVideoProcessor } from './hooks/useVideoProcessor';
 import DownloadIcon from './components/icons/DownloadIcon';
 import ProcessingSpinnerIcon from './components/icons/ProcessingSpinnerIcon';
@@ -32,7 +33,7 @@ try {
 }
 
 
-type FeatureMode = 'modify' | 'watermark';
+type FeatureMode = 'modify' | 'watermark' | 'sora';
 
 const App: React.FC = () => {
   const [featureMode, setFeatureMode] = useState<FeatureMode>('modify');
@@ -361,7 +362,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         </p>
         
         {/* Feature Tabs */}
-        <div className="flex justify-center gap-4 mt-6">
+        <div className="flex flex-wrap justify-center gap-3 mt-6">
           <button
             onClick={() => {
               setFeatureMode('modify');
@@ -388,6 +389,20 @@ Based on the user's request, provide the JSON settings object as instructed.`;
           >
             Watermark Removal
           </button>
+          <button
+            onClick={() => {
+              setFeatureMode('sora');
+              setVideoFile(null);
+            }}
+            className={`px-6 py-2 rounded-lg font-semibold transition-colors duration-200 ${
+              featureMode === 'sora'
+                ? 'bg-indigo-600 text-white'
+                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+            }`}
+            title="Remove the bouncing Sora 2 / ChatGPT video watermark"
+          >
+            Sora 2 Watermark Remover
+          </button>
         </div>
       </header>
 
@@ -411,7 +426,9 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       )}
 
       <main className="w-full max-w-5xl">
-        {featureMode === 'watermark' ? (
+        {featureMode === 'sora' ? (
+          <SoraWatermarkRemover />
+        ) : featureMode === 'watermark' ? (
           <WatermarkRemover />
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">

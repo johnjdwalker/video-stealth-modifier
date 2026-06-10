@@ -63,5 +63,54 @@ export interface WatermarkRemovalState {
   processedVideoUrl: string | null;
 }
 
+// ----------------------------------------------------------------------------
+// Sora 2 / animated watermark types
+// ----------------------------------------------------------------------------
+
+/**
+ * One sample of the watermark's bounding box at a specific point in time.
+ * Used to build a trajectory for moving watermarks (Sora's bouncing logo).
+ */
+export interface SoraWatermarkSample {
+  time: number;        // seconds
+  bbox: WatermarkCoords;
+  confidence: number;  // 0-100
+}
+
+/**
+ * Full result of running auto-detection against a video. The trajectory is the
+ * sorted list of samples; downstream code interpolates between samples.
+ */
+export interface SoraWatermarkDetection {
+  detected: boolean;
+  videoWidth: number;
+  videoHeight: number;
+  videoDuration: number;
+  /** Sorted ascending by `time`. */
+  trajectory: SoraWatermarkSample[];
+  /**
+   * Padding (in pixels) to add around each detected box during removal so that
+   * we cover the soft edges and any aliasing of the watermark.
+   */
+  padding: number;
+  /** Average detection confidence across samples. 0-100. */
+  averageConfidence: number;
+  /** When detection finishes empty-handed, why. */
+  message?: string;
+}
+
+export type SoraRemovalQuality = 'fast' | 'balanced' | 'high';
+
+export interface SoraRemovalState {
+  isDetecting: boolean;
+  isRemoving: boolean;
+  detection: SoraWatermarkDetection | null;
+  progress: number;
+  stageMessage: string;
+  error: string | null;
+  processedVideoUrl: string | null;
+  processedMimeType: string | null;
+}
+
 // DEFAULT_VIDEO_SETTINGS is defined and exported from constants.ts
 // and should be imported from there if needed.

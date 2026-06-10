@@ -4,6 +4,10 @@ A web application for subtly modifying videos with AI-powered suggestions. Adjus
 
 ## Features
 
+- 🪄 **Sora 2 watermark remover**: dedicated tool for the bouncing white logo
+  produced by Sora 2 / ChatGPT video. Tracks the watermark across the whole
+  clip and reconstructs each covered pixel from frames where the watermark
+  was elsewhere — feathered for seamless blending.
 - 🎨 **Visual Adjustments**: Brightness, contrast, saturation, hue rotation
 - 🖼️ **Stylistic Filters**: Blur, sepia, grayscale, vignette
 - ⚡ **Playback Speed**: Adjust video speed (0.5x - 2.0x) with optional pitch preservation
