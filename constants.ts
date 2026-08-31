@@ -165,5 +165,4 @@ export const WATERMARK_DETECTION_SAMPLE_INTERVAL_SECONDS = 2; // Sample every 2 
 export const WATERMARK_CORNER_REGION_PERCENTAGE = 0.15; // Check 15% of width/height in corners
 export const WATERMARK_VARIANCE_THRESHOLD = 500; // Lower variance suggests watermark
 export const WATERMARK_VARIANCE_STD_THRESHOLD = 200; // Standard deviation threshold
-export const WATERMARK_INPAINT_RADIUS = 8; // Pixels to sample for inpainting
 export const WATERMARK_INPAINT_PADDING = 5; // Padding around watermark region

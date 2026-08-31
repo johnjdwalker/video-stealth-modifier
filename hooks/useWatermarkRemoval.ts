@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { WatermarkRemovalState, WatermarkDetectionResult } from '../types';
+import { WatermarkRemovalState } from '../types';
 import { detectWatermark, removeWatermark } from '../services/watermarkService';
 
 export function useWatermarkRemoval() {
@@ -12,8 +12,10 @@ export function useWatermarkRemoval() {
     processedVideoUrl: null,
   });
 
-  const detectionCancelledRef = useRef<boolean>(false);
-  const removalCancelledRef = useRef<boolean>(false);
+  // AbortControllers rather than plain flags: a flag only stopped the hook
+  // from applying results, it never told the service to stop decoding.
+  const detectionAbortRef = useRef<AbortController | null>(null);
+  const removalAbortRef = useRef<AbortController | null>(null);
 
   // Cleanup processed video URL on unmount
   useEffect(() => {
@@ -26,8 +28,9 @@ export function useWatermarkRemoval() {
   }, [state.processedVideoUrl]);
 
   const detectWatermarkHandler = useCallback(async (videoFile: File) => {
-    // Reset cancellation flag
-    detectionCancelledRef.current = false;
+    detectionAbortRef.current?.abort();
+    const ac = new AbortController();
+    detectionAbortRef.current = ac;
 
     setState((prev) => ({
       ...prev,
@@ -39,12 +42,12 @@ export function useWatermarkRemoval() {
 
     try {
       const result = await detectWatermark(videoFile, (progress) => {
-        if (!detectionCancelledRef.current) {
+        if (!ac.signal.aborted) {
           setState((prev) => ({ ...prev, progress }));
         }
-      });
+      }, ac.signal);
 
-      if (!detectionCancelledRef.current) {
+      if (!ac.signal.aborted) {
         setState((prev) => ({
           ...prev,
           isDetecting: false,
@@ -53,7 +56,7 @@ export function useWatermarkRemoval() {
         }));
       }
     } catch (error: any) {
-      if (!detectionCancelledRef.current) {
+      if (!ac.signal.aborted) {
         setState((prev) => ({
           ...prev,
           isDetecting: false,
@@ -73,8 +76,9 @@ export function useWatermarkRemoval() {
       return;
     }
 
-    // Reset cancellation flag
-    removalCancelledRef.current = false;
+    removalAbortRef.current?.abort();
+    const ac = new AbortController();
+    removalAbortRef.current = ac;
 
     setState((prev) => ({
       ...prev,
@@ -88,13 +92,14 @@ export function useWatermarkRemoval() {
         videoFile,
         state.detectionResult.coords,
         (progress) => {
-          if (!removalCancelledRef.current) {
+          if (!ac.signal.aborted) {
             setState((prev) => ({ ...prev, progress }));
           }
-        }
+        },
+        ac.signal
       );
 
-      if (!removalCancelledRef.current) {
+      if (!ac.signal.aborted) {
         const url = URL.createObjectURL(blob);
         setState((prev) => ({
           ...prev,
@@ -104,7 +109,7 @@ export function useWatermarkRemoval() {
         }));
       }
     } catch (error: any) {
-      if (!removalCancelledRef.current) {
+      if (!ac.signal.aborted) {
         setState((prev) => ({
           ...prev,
           isRemoving: false,
@@ -117,7 +122,7 @@ export function useWatermarkRemoval() {
 
   const cancelDetection = useCallback(() => {
     if (state.isDetecting) {
-      detectionCancelledRef.current = true;
+      detectionAbortRef.current?.abort();
       setState((prev) => ({
         ...prev,
         isDetecting: false,
@@ -129,7 +134,7 @@ export function useWatermarkRemoval() {
 
   const cancelRemoval = useCallback(() => {
     if (state.isRemoving) {
-      removalCancelledRef.current = true;
+      removalAbortRef.current?.abort();
       setState((prev) => ({
         ...prev,
         isRemoving: false,
@@ -140,8 +145,8 @@ export function useWatermarkRemoval() {
   }, [state.isRemoving]);
 
   const reset = useCallback(() => {
-    detectionCancelledRef.current = true;
-    removalCancelledRef.current = true;
+    detectionAbortRef.current?.abort();
+    removalAbortRef.current?.abort();
     
     setState({
       isDetecting: false,

@@ -24,8 +24,12 @@ const VideoInfo: React.FC<VideoInfoProps> = ({ fileName, fileSize, fileType, dur
   };
 
   const getFileExtension = (filename: string, mimeType: string): string => {
-    const ext = filename.split('.').pop()?.toUpperCase();
-    if (ext) return ext;
+    // Only treat the tail as an extension if there actually is a dot;
+    // "myvideo" would otherwise be reported as format "MYVIDEO".
+    const dot = filename.lastIndexOf('.');
+    if (dot > 0 && dot < filename.length - 1) {
+      return filename.slice(dot + 1).toUpperCase();
+    }
     
     // Fallback to MIME type
     const typeMap: Record<string, string> = {

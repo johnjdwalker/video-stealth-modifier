@@ -51,6 +51,8 @@ export function useVideoProcessor() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameIdRef = useRef<number>(0);
+  const sourceObjectUrlRef = useRef<string | null>(null);
+  const cancelledRef = useRef(false);
 
   // Refs for rotating lines effect state
   const rotationAngle1Ref = useRef<number>(0);
@@ -72,6 +74,12 @@ export function useVideoProcessor() {
       sourceVideoRef.current.removeAttribute('src');
       sourceVideoRef.current.load();
       sourceVideoRef.current = null;
+    }
+    // Revoke the blob URL for the source file; without this every processing
+    // run pins another copy of the (up to 500MB) input in memory.
+    if (sourceObjectUrlRef.current) {
+      URL.revokeObjectURL(sourceObjectUrlRef.current);
+      sourceObjectUrlRef.current = null;
     }
     if (canvasRef.current) {
       canvasRef.current = null;
@@ -109,6 +117,9 @@ export function useVideoProcessor() {
     if (!isProcessing) return;
 
     setIsCancelling(true);
+    // Set before cleanup(): stopping the recorder fires `onstop`, which must
+    // discard the partial recording instead of offering it as a download.
+    cancelledRef.current = true;
     setProcessingError('Processing cancelled by user');
     await cleanup();
     setIsProcessing(false);
@@ -118,10 +129,9 @@ export function useVideoProcessor() {
 
   const processVideo = useCallback(async (videoFile: File, settings: VideoSettings): Promise<string | null> => {
     setIsProcessing(true);
+    cancelledRef.current = false;
 
-    if (internalProcessedVideoUrl) {
-      URL.revokeObjectURL(internalProcessedVideoUrl);
-    }
+    // The previous URL is revoked by the effect above when this state changes.
     setProcessedVideoUrl(null);
     setProcessedMimeType(null);
 
@@ -201,26 +211,28 @@ export function useVideoProcessor() {
 
         let audioTrack: MediaStreamTrack | undefined;
         let gainNode: GainNode | null = null;
-        const hasAudioTracks = (video as any).audioTracks && (video as any).audioTracks.length > 0;
-        const hasMozAudio = (video as any).mozHasAudio;
-        const hasWebkitAudio = (video as any).webkitAudioDecodedByteCount !== undefined && (video as any).webkitAudioDecodedByteCount > 0;
 
-        if (hasAudioTracks || hasMozAudio || hasWebkitAudio) {
-          try {
-            const sourceNode = audioContext.createMediaElementSource(video);
-            const node = audioContext.createGain();
-            const targetGain = settings.volume / 100;
-            const fadeIn = Math.max(0, settings.audioFadeInSeconds || 0);
-            node.gain.value = fadeIn > 0 ? 0 : targetGain;
-            sourceNode.connect(node);
+        // The audio graph is always wired up rather than gated on a
+        // "does this video have audio?" probe. There is no portable way to
+        // answer that question at `loadedmetadata` time: `video.audioTracks`
+        // is Firefox/Safari-only, `mozHasAudio` is Firefox-only, and Chrome's
+        // `webkitAudioDecodedByteCount` is still 0 before playback begins —
+        // so probing dropped the audio of every video in Chrome and Edge.
+        // A video with no audio simply contributes a silent track.
+        try {
+          const sourceNode = audioContext.createMediaElementSource(video);
+          const node = audioContext.createGain();
+          const targetGain = settings.volume / 100;
+          const fadeIn = Math.max(0, settings.audioFadeInSeconds || 0);
+          node.gain.value = fadeIn > 0 ? 0 : targetGain;
+          sourceNode.connect(node);
 
-            const audioDestinationNode = audioContext.createMediaStreamDestination();
-            node.connect(audioDestinationNode);
-            audioTrack = audioDestinationNode.stream.getAudioTracks()[0];
-            gainNode = node;
-          } catch (audioErr) {
-            console.warn('Could not process audio track:', audioErr);
-          }
+          const audioDestinationNode = audioContext.createMediaStreamDestination();
+          node.connect(audioDestinationNode);
+          audioTrack = audioDestinationNode.stream.getAudioTracks()[0];
+          gainNode = node;
+        } catch (audioErr) {
+          console.warn('Could not process audio track; exporting video only:', audioErr);
         }
 
         const canvasStream = canvas.captureStream(FPS);
@@ -267,6 +279,17 @@ export function useVideoProcessor() {
         };
 
         mediaRecorder.onstop = () => {
+          if (cancelledRef.current) {
+            // Cancelled mid-recording: throw the partial capture away and leave
+            // the cancellation state (error message, 0% progress) untouched.
+            recordedChunksRef.current = [];
+            mediaRecorderRef.current = null;
+            if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
+            animationFrameIdRef.current = 0;
+            resolve(null);
+            return;
+          }
+
           const blob = new Blob(recordedChunksRef.current, { type: mediaRecorder.mimeType });
           const url = URL.createObjectURL(blob);
           setProcessedVideoUrl(url);
@@ -481,9 +504,11 @@ export function useVideoProcessor() {
         reject(new Error(err));
       };
 
-      video.src = URL.createObjectURL(videoFile);
+      const objectUrl = URL.createObjectURL(videoFile);
+      sourceObjectUrlRef.current = objectUrl;
+      video.src = objectUrl;
     });
-  }, [cleanup, internalProcessedVideoUrl]);
+  }, [cleanup]);
 
   return {
     processVideo,

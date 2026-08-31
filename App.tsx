@@ -89,6 +89,16 @@ const App: React.FC = () => {
   // Effect to add keyboard shortcuts
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
+      // Never steal keys while the user is typing in a field (AI prompt,
+      // preset name, …) — Escape included.
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) {
+          return;
+        }
+      }
+
       // Use Cmd on Mac, Ctrl on Windows/Linux
       const modifier = e.metaKey || e.ctrlKey;
       
@@ -215,17 +225,25 @@ const App: React.FC = () => {
     setGeminiError(null); // Clear AI error on new file
     setFileError(null); // Clear file error on successful selection
     setVideoDuration(undefined); // Reset duration
+    // The trim window is measured against a specific video, so carrying one
+    // over from the previous clip would silently truncate this export.
+    setCurrentSettings((prev) => ({ ...prev, trimStartSeconds: null, trimEndSeconds: null }));
     
-    // Get video duration
+    // Probe the file for its duration. The object URL is revoked on every
+    // path — including load failures — so the blob is not pinned in memory.
     const video = document.createElement('video');
+    const probeUrl = URL.createObjectURL(file);
     video.preload = 'metadata';
     video.onloadedmetadata = () => {
       if (isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
-      URL.revokeObjectURL(video.src);
+      URL.revokeObjectURL(probeUrl);
     };
-    video.src = URL.createObjectURL(file);
+    video.onerror = () => {
+      URL.revokeObjectURL(probeUrl);
+    };
+    video.src = probeUrl;
   };
   
   const handleFileError = (error: string) => {
@@ -237,12 +255,22 @@ const App: React.FC = () => {
     setCurrentSettings(newSettings); 
   };
 
+  const switchFeatureMode = (mode: FeatureMode) => {
+    setFeatureMode(mode);
+    setVideoFile(null);
+    setProcessedVideoUrl(null);
+    setGeminiError(null);
+    setFileError(null);
+    setVideoDuration(undefined);
+  };
+
   const handleUploadDifferent = () => {
     setVideoFile(null); 
     setProcessedVideoUrl(null);
     setGeminiPrompt("");
     setGeminiError(null);
     setFileError(null);
+    setVideoDuration(undefined);
   };
 
   const handleSuggestSettings = async () => {
@@ -287,7 +315,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
 
     try {
       const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-preview-04-17',
+        model: 'gemini-2.5-flash',
         contents: userRequestPrompt,
         config: {
           systemInstruction: systemInstruction,
@@ -295,7 +323,12 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         },
       });
 
-      let jsonStr = response.text.trim();
+      const rawText = response.text;
+      if (typeof rawText !== 'string' || !rawText.trim()) {
+        throw new Error('The AI returned an empty response. Please try rephrasing your description.');
+      }
+
+      let jsonStr = rawText.trim();
       const fenceRegex = /^```(?:json)?\s*\n?(.*?)\n?\s*```$/s;
       const match = jsonStr.match(fenceRegex);
       if (match && match[1]) {
@@ -364,10 +397,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         {/* Feature Tabs */}
         <div className="flex flex-wrap justify-center gap-3 mt-6">
           <button
-            onClick={() => {
-              setFeatureMode('modify');
-              setVideoFile(null);
-            }}
+            onClick={() => switchFeatureMode('modify')}
             className={`px-6 py-2 rounded-lg font-semibold transition-colors duration-200 ${
               featureMode === 'modify'
                 ? 'bg-indigo-600 text-white'
@@ -377,10 +407,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
             Video Modification
           </button>
           <button
-            onClick={() => {
-              setFeatureMode('watermark');
-              setVideoFile(null);
-            }}
+            onClick={() => switchFeatureMode('watermark')}
             className={`px-6 py-2 rounded-lg font-semibold transition-colors duration-200 ${
               featureMode === 'watermark'
                 ? 'bg-indigo-600 text-white'
@@ -390,10 +417,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
             Watermark Removal
           </button>
           <button
-            onClick={() => {
-              setFeatureMode('sora');
-              setVideoFile(null);
-            }}
+            onClick={() => switchFeatureMode('sora')}
             className={`px-6 py-2 rounded-lg font-semibold transition-colors duration-200 ${
               featureMode === 'sora'
                 ? 'bg-indigo-600 text-white'
