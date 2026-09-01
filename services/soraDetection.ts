@@ -28,10 +28,12 @@ export const WORK_LONG_SIDE = 480;
 // watermark's stroke thickness but stay well under the size of a sky/wall.
 const TOPHAT_RADIUS_FRAC = 0.035;
 // Minimum local-contrast response (0-255) for a pixel to be watermark-like.
-const TOPHAT_MIN = 22;
+// Sora marks are sometimes rendered at partial opacity, so keep this low.
+const TOPHAT_MIN = 14;
 // The mark is white-ish: a floor on absolute luminance and a ceiling on saturation.
-const MIN_LUMINANCE = 140;
-const MAX_SATURATION = 90;
+// Partial-opacity marks on bright backgrounds can be dimmer than expected.
+const MIN_LUMINANCE = 110;
+const MAX_SATURATION = 110;
 
 // Horizontal closing radius (fraction of long side) used to merge the icon and
 // the individual letters of "Sora" into a single connected blob.
@@ -49,12 +51,13 @@ const MAX_ASPECT = 8.0;
 
 // Fraction of a candidate's box that should be watermark-like. Below the band
 // is noise; above it is a solid shape rather than an icon plus lettering.
-const DENSITY_IDEAL_MIN = 0.20;
-const DENSITY_IDEAL_MAX = 0.65;
+const DENSITY_IDEAL_MIN = 0.10;
+const DENSITY_IDEAL_MAX = 0.70;
 
 // The mark hugs an edge: its centre must fall in the outer band of the frame
-// on at least one axis.
-const EDGE_BAND_FRAC = 0.38;
+// on at least one axis.  0.45 is generous enough for marks that sit near (but
+// not at) a corner, including marks near a face in the upper portion of the frame.
+const EDGE_BAND_FRAC = 0.45;
 
 // Candidates kept per sampled frame, so clustering can recover when the best
 // scoring blob in one frame is a fluke.
@@ -65,7 +68,8 @@ const CANDIDATES_PER_FRAME = 4;
 const DWELL_CENTRE_TOLERANCE_FRAC = 0.05;
 const DWELL_MAX_SAMPLE_GAP = 2;
 // A dwell needs at least this many samples to be believed.
-const MIN_DWELL_SAMPLES = 3;
+// 2 is enough to confirm persistence; 3 risks missing the mark in short clips.
+const MIN_DWELL_SAMPLES = 2;
 
 export interface DetectionCandidate {
   bbox: WatermarkCoords;   // work-resolution pixels

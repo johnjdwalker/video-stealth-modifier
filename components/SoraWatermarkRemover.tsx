@@ -19,30 +19,6 @@ const FILL_OPTIONS: Array<{ value: SoraFillMode; label: string; description: str
   { value: 'inpaint',  label: 'Inpaint edges',     description: 'Rebuild from the surrounding pixels. Never ghosts, but softer over detail.' },
 ];
 
-/**
- * Where the video is actually painted inside its element.
- *
- * `object-contain` letterboxes the picture, so the element's own bounding box
- * is not the picture's box. Measuring against the element is what put the old
- * tracking overlay out in the black bars on portrait clips.
- */
-function getContentRect(video: HTMLVideoElement) {
-  const el = video.getBoundingClientRect();
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  if (!vw || !vh || el.width === 0 || el.height === 0) return null;
-  const scale = Math.min(el.width / vw, el.height / vh);
-  const width = vw * scale;
-  const height = vh * scale;
-  return {
-    left: el.left + (el.width - width) / 2,
-    top: el.top + (el.height - height) / 2,
-    width,
-    height,
-    scale,
-  };
-}
-
 function formatTime(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return '0:00';
   const mins = Math.floor(seconds / 60);
@@ -52,11 +28,9 @@ function formatTime(seconds: number): string {
 
 interface VideoStageProps {
   src: string | null;
-  /** Effective dwells, used to draw the tracked region. */
   dwells?: SoraDwell[];
   padding?: number;
   showOverlay?: boolean;
-  /** When set, clicking the picture reports the clicked point in video pixels. */
   onPickPoint?: (videoX: number, videoY: number, time: number, video: HTMLVideoElement) => void;
   onTimeUpdate?: (time: number) => void;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
@@ -69,57 +43,94 @@ const VideoStage: React.FC<VideoStageProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const localRef = useRef<HTMLVideoElement>(null);
   const video = videoRef ?? localRef;
-  const overlayRef = useRef<HTMLDivElement>(null);
+  // Canvas overlay — avoids getBoundingClientRect on the video element entirely.
+  // We compute object-contain scale from clientWidth/clientHeight and draw in
+  // video-pixel coordinates with a matching transform. This is immune to the
+  // letterbox coordinate errors the old div overlay had.
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
   const lastReportedTime = useRef(0);
   const [aspect, setAspect] = useState<number | null>(null);
 
-  // Drive the overlay from a rAF loop so it tracks playback smoothly.
   useEffect(() => {
     const tick = () => {
-      const v = video.current;
-      const o = overlayRef.current;
-      const c = containerRef.current;
       rafRef.current = requestAnimationFrame(tick);
+      const v = video.current;
+      const c = containerRef.current;
+      const cvs = canvasRef.current;
       if (!v || !c) return;
-      // The overlay itself is repositioned every frame, but reporting the time
-      // upward that often would re-render the whole panel 60 times a second.
-      // A playhead does not need better than ~10Hz.
+
       if (onTimeUpdate && Math.abs(v.currentTime - lastReportedTime.current) > 0.1) {
         lastReportedTime.current = v.currentTime;
         onTimeUpdate(v.currentTime);
       }
-      if (!o) return;
 
-      if (!showOverlay || !dwells || dwells.length === 0 || !v.videoWidth) {
-        o.style.display = 'none';
-        return;
+      if (!cvs) return;
+      const ctx = cvs.getContext('2d');
+      if (!ctx) return;
+
+      const containerW = c.clientWidth;
+      const containerH = c.clientHeight;
+      const dpr = window.devicePixelRatio || 1;
+      const W = Math.max(1, Math.round(containerW * dpr));
+      const H = Math.max(1, Math.round(containerH * dpr));
+      if (cvs.width !== W || cvs.height !== H) {
+        cvs.width = W;
+        cvs.height = H;
       }
-      const box = boxAtTime(dwells, v.currentTime, padding, v.videoWidth, v.videoHeight);
-      const content = getContentRect(v);
-      if (!box || !content) { o.style.display = 'none'; return; }
+      ctx.clearRect(0, 0, W, H);
 
-      const cRect = c.getBoundingClientRect();
-      o.style.left = `${content.left - cRect.left + box.x * content.scale}px`;
-      o.style.top = `${content.top - cRect.top + box.y * content.scale}px`;
-      o.style.width = `${box.width * content.scale}px`;
-      o.style.height = `${box.height * content.scale}px`;
-      o.style.display = 'block';
+      if (!showOverlay || !dwells || dwells.length === 0 || !v.videoWidth || !v.videoHeight) return;
+
+      const box = boxAtTime(dwells, v.currentTime, padding, v.videoWidth, v.videoHeight);
+      if (!box) return;
+
+      // Replicate object-contain: scale to fill whichever axis is tighter.
+      const vw = v.videoWidth;
+      const vh = v.videoHeight;
+      const scale = Math.min(W / vw, H / vh);
+      const ox = (W - vw * scale) / 2; // horizontal letterbox offset
+      const oy = (H - vh * scale) / 2; // vertical letterbox offset
+
+      ctx.save();
+      ctx.setTransform(scale, 0, 0, scale, ox, oy);
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.16)';
+      ctx.fillRect(box.x, box.y, box.width, box.height);
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 2 / scale;
+      ctx.shadowColor = 'rgba(0,0,0,0.55)';
+      ctx.shadowBlur = 3 / scale;
+      ctx.strokeRect(box.x, box.y, box.width, box.height);
+      ctx.restore();
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
   }, [showOverlay, dwells, padding, onTimeUpdate, video]);
 
+  // Click handler: converts click to video-pixel coordinates using the same
+  // object-contain math as the canvas overlay.
   const handleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (!onPickPoint) return;
     const v = video.current;
-    if (!v || !v.videoWidth) return;
-    const content = getContentRect(v);
-    if (!content) return;
-    const x = (e.clientX - content.left) / content.scale;
-    const y = (e.clientY - content.top) / content.scale;
-    // Ignore clicks that land in the letterbox rather than on the picture.
-    if (x < 0 || y < 0 || x > v.videoWidth || y > v.videoHeight) return;
+    const c = containerRef.current;
+    if (!v || !c || !v.videoWidth || !v.videoHeight) return;
+
+    const containerW = c.clientWidth;
+    const containerH = c.clientHeight;
+    const vw = v.videoWidth;
+    const vh = v.videoHeight;
+    const scale = Math.min(containerW / vw, containerH / vh);
+    const ox = (containerW - vw * scale) / 2;
+    const oy = (containerH - vh * scale) / 2;
+
+    const cRect = c.getBoundingClientRect();
+    const cx = e.clientX - cRect.left;
+    const cy = e.clientY - cRect.top;
+
+    const x = (cx - ox) / scale;
+    const y = (cy - oy) / scale;
+    if (x < 0 || y < 0 || x > vw || y > vh) return;
+
     onPickPoint(x, y, v.currentTime, v);
   }, [onPickPoint, video]);
 
@@ -151,27 +162,27 @@ const VideoStage: React.FC<VideoStageProps> = ({
         }}
         className="w-full h-full object-contain"
       />
+      {/* Canvas overlay: drawn in video-pixel coordinates, immune to letterbox bugs */}
+      <canvas
+        ref={canvasRef}
+        aria-hidden
+        style={{
+          position: 'absolute',
+          inset: 0,
+          width: '100%',
+          height: '100%',
+          pointerEvents: 'none',
+          zIndex: 10,
+        }}
+      />
       {onPickPoint && (
-        // Transparent hit layer above the picture but below the native controls
-        // strip, so scrubbing still works while placing corrections.
         <div
           onClick={handleClick}
           className="absolute inset-x-0 top-0 cursor-crosshair"
           style={{ bottom: '3.5rem', zIndex: 15 }}
-          aria-label="Click the watermark to correct its position"
+          aria-label="Click the watermark to set its position"
         />
       )}
-      <div
-        ref={overlayRef}
-        aria-hidden="true"
-        className="pointer-events-none absolute hidden rounded-sm"
-        style={{
-          border: '2px solid #f59e0b',
-          backgroundColor: 'rgba(245, 158, 11, 0.16)',
-          boxShadow: '0 0 0 1px rgba(0,0,0,0.6)',
-          zIndex: 10,
-        }}
-      />
     </div>
   );
 };
@@ -292,13 +303,26 @@ const SoraWatermarkRemover: React.FC = () => {
     reset();
   };
 
+  // When detection finishes with no result, turn on click-to-fix automatically
+  // so the user can just click the watermark without having to find the toggle.
+  const prevDetecting = useRef(false);
+  useEffect(() => {
+    if (prevDetecting.current && !state.isDetecting) {
+      // Detection just finished
+      if (state.detection && !state.detection.detected) {
+        setCorrecting(true);
+        setLastAction('Auto-detect found nothing. Click directly on the watermark in the video to place it manually.');
+      }
+    }
+    prevDetecting.current = state.isDetecting;
+  }, [state.isDetecting, state.detection]);
+
   const handlePickPoint = useCallback((x: number, y: number, time: number, video: HTMLVideoElement) => {
-    // Pause so the placed box can be checked against the frame it was set on.
     video.pause();
     const box: WatermarkCoords = snapBoxToClick(video, x, y, state.detection?.logoSize ?? null);
     addCorrection(time, box);
     clearPreview();
-    setLastAction(`Watermark position set at ${formatTime(time)}.`);
+    setLastAction(`Watermark position set at ${formatTime(time)} — amber box should now sit on the mark.`);
   }, [addCorrection, clearPreview, state.detection]);
 
   const seekTo = useCallback((time: number) => {
@@ -335,10 +359,10 @@ const SoraWatermarkRemover: React.FC = () => {
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 text-sm text-gray-300">
             <p className="font-semibold text-gray-100 mb-2">How this works</p>
             <ol className="list-decimal ml-5 space-y-1 text-gray-400">
-              <li><span className="text-gray-200">Detect</span> — the clip is sampled and the watermark is tracked as a set of positions it holds over time.</li>
-              <li><span className="text-gray-200">Correct</span> — if a position is wrong, click the watermark on the video and your click wins for that stretch.</li>
-              <li><span className="text-gray-200">Preview the fill</span> — compare fill methods on a single frame before committing to a full re-encode.</li>
-              <li><span className="text-gray-200">Remove</span> — the clip is rebuilt at high bitrate, MP4 where the browser allows it.</li>
+              <li><span className="text-gray-200">Detect</span> — samples frames and tracks where the watermark sits over time.</li>
+              <li><span className="text-gray-200">Correct</span> — if the amber box is off, click directly on the watermark to fix it.</li>
+              <li><span className="text-gray-200">Preview the fill</span> — compare fill methods on a single frame before committing.</li>
+              <li><span className="text-gray-200">Remove</span> — rebuilds the clip at high bitrate, MP4 where the browser allows it.</li>
             </ol>
             <p className="text-gray-500 mt-2">Everything runs in your browser. Nothing is uploaded.</p>
           </div>
@@ -348,7 +372,9 @@ const SoraWatermarkRemover: React.FC = () => {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div>
               <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">
-                Original {hasTimeline && <span className="text-sm font-normal text-amber-400">· tracked region shown</span>}
+                Original
+                {hasTimeline && <span className="text-sm font-normal text-amber-400"> · amber box = watermark region</span>}
+                {correcting && <span className="text-sm font-normal text-emerald-400"> · click the watermark</span>}
               </h4>
               <VideoStage
                 src={previewUrl}
@@ -443,6 +469,16 @@ const SoraWatermarkRemover: React.FC = () => {
               </div>
             )}
 
+            {detection && !detection.detected && (
+              <div className="bg-amber-900/40 border border-amber-700 rounded-lg p-4 text-sm">
+                <p className="text-amber-300 font-semibold mb-1">Auto-detect found nothing</p>
+                <p className="text-amber-200/80">
+                  Click-to-fix is now on — click directly on the watermark in the video above.
+                  The amber box will appear and you can then remove it.
+                </p>
+              </div>
+            )}
+
             {/* Step 2 — correct */}
             <div className="border-t border-gray-700 pt-4">
               <div className="flex flex-wrap items-center justify-between gap-3 mb-2">
@@ -459,8 +495,8 @@ const SoraWatermarkRemover: React.FC = () => {
               </div>
               <p className="text-sm text-gray-400">
                 {correcting
-                  ? 'Click directly on the watermark in the video. The click snaps to the mark under your cursor and overrides the tracked position for that stretch of the clip. The video pauses so you can check the box.'
-                  : 'Turn this on if the amber box is not sitting on the watermark, then click the watermark in the video to correct it.'}
+                  ? 'Click directly on the watermark in the video. The video pauses so you can verify the amber box is correct.'
+                  : 'Turn this on if the amber box is off-target, then click the watermark in the video.'}
               </p>
               {lastAction && <p className="text-sm text-emerald-400 mt-2" role="status">{lastAction}</p>}
 
@@ -529,7 +565,7 @@ const SoraWatermarkRemover: React.FC = () => {
                 {isPreviewing ? (
                   <><ProcessingSpinnerIcon className="w-4 h-4 mr-2" /> Rendering preview…</>
                 ) : (
-                  `Preview this fill on the current frame (${formatTime(currentTime)})`
+                  `Preview fill on current frame (${formatTime(currentTime)})`
                 )}
               </button>
 
@@ -603,7 +639,7 @@ const SoraWatermarkRemover: React.FC = () => {
 
               {!hasTimeline && !state.isDetecting && (
                 <p className="text-sm text-gray-400">
-                  Run detection first — or turn on click-to-fix and click the watermark to place it yourself.
+                  Run detection first — or turn on Click-to-fix and click the watermark to place it yourself.
                 </p>
               )}
             </div>
