@@ -5,7 +5,6 @@ import {
   WATERMARK_CORNER_REGION_PERCENTAGE,
   WATERMARK_VARIANCE_THRESHOLD,
   WATERMARK_VARIANCE_STD_THRESHOLD,
-  WATERMARK_INPAINT_RADIUS,
   WATERMARK_INPAINT_PADDING,
 } from '../constants';
 
@@ -15,7 +14,8 @@ import {
  */
 export async function detectWatermark(
   videoFile: File,
-  onProgress?: (progress: number) => void
+  onProgress?: (progress: number) => void,
+  signal?: AbortSignal
 ): Promise<WatermarkDetectionResult> {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
@@ -54,14 +54,22 @@ export async function detectWatermark(
         const sampleInterval = videoDuration / (sampleCount + 1);
         const frames: ImageData[] = [];
 
-        // Extract sample frames
+        // Extract sample frames.
         for (let i = 1; i <= sampleCount; i++) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
           const time = sampleInterval * i;
-          video.currentTime = time;
-          
-          await new Promise<void>((resolveSeek) => {
-            const onSeeked = () => {
+
+          // The 'seeked' listener must be attached *before* assigning
+          // currentTime. Assigning first races the event: when the seek
+          // completes before the listener is attached the promise never
+          // settles and detection hangs on the spinner forever.
+          await new Promise<void>((resolveSeek, rejectSeek) => {
+            const done = () => {
               video.removeEventListener('seeked', onSeeked);
+              video.removeEventListener('error', onSeekError);
+            };
+            const onSeeked = () => {
+              done();
               ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
               frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
               if (onProgress) {
@@ -69,7 +77,18 @@ export async function detectWatermark(
               }
               resolveSeek();
             };
+            const onSeekError = () => {
+              done();
+              rejectSeek(new Error('Seek failed while sampling frames.'));
+            };
             video.addEventListener('seeked', onSeeked);
+            video.addEventListener('error', onSeekError);
+            try {
+              video.currentTime = time;
+            } catch (err) {
+              done();
+              rejectSeek(err as Error);
+            }
           });
         }
 
@@ -189,7 +208,8 @@ function calculateRegionVariance(frame: ImageData, region: { x: number; y: numbe
 export async function removeWatermark(
   videoFile: File,
   watermarkCoords: WatermarkCoords,
-  onProgress?: (progress: number) => void
+  onProgress?: (progress: number) => void,
+  signal?: AbortSignal
 ): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
@@ -200,6 +220,8 @@ export async function removeWatermark(
       reject(new Error('Could not get canvas context for watermark removal'));
       return;
     }
+
+    let rafId = 0;
 
     const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     let audioTrack: MediaStreamTrack | undefined;
@@ -243,12 +265,19 @@ export async function removeWatermark(
         };
 
         mediaRecorder.onstop = () => {
-          const blob = new Blob(recordedChunks, { type: mimeType });
-          resolve(blob);
-          URL.revokeObjectURL(video.src);
+          if (rafId) cancelAnimationFrame(rafId);
+          const srcUrl = video.src;
+          video.removeAttribute('src');
+          video.load();
+          URL.revokeObjectURL(srcUrl);
           if (audioContext.state !== 'closed') {
             audioContext.close().catch(console.error);
           }
+          if (signal?.aborted) {
+            reject(new DOMException('Aborted', 'AbortError'));
+            return;
+          }
+          resolve(new Blob(recordedChunks, { type: mimeType }));
         };
 
         mediaRecorder.onerror = (event: any) => {
@@ -258,6 +287,16 @@ export async function removeWatermark(
 
         // Draw frame with watermark removal
         const drawFrame = () => {
+          if (signal?.aborted) {
+            // Stop decoding/encoding immediately. Without this the render loop
+            // kept running (and the tab kept burning CPU) after the user
+            // cancelled — the UI just stopped listening to it.
+            video.pause();
+            if (mediaRecorder.state === 'recording') {
+              mediaRecorder.stop();
+            }
+            return;
+          }
           if (video.paused || video.ended) {
             if (mediaRecorder.state === 'recording') {
               mediaRecorder.stop();
@@ -278,7 +317,7 @@ export async function removeWatermark(
             }
           }
 
-          requestAnimationFrame(drawFrame);
+          rafId = requestAnimationFrame(drawFrame);
         };
 
         video.onplay = () => {
@@ -314,8 +353,22 @@ export async function removeWatermark(
 }
 
 /**
- * Removes watermark from a single frame using inpainting technique
- * Uses a simple blur/fill approach for the watermark region
+ * Removes the watermark from a single frame.
+ *
+ * Every pixel inside the region is reconstructed by inverse-distance
+ * interpolation between the four *clean* border pixels that bracket it
+ * (the row/column immediately outside the region). This replaces an earlier
+ * neighbourhood-average implementation that had two defects:
+ *
+ *   - it allocated one array per sampled neighbour, i.e. millions of short
+ *     lived arrays per frame (a 15% corner of a 1080p frame sampled a 17x17
+ *     neighbourhood for each of ~46,000 pixels), which stalled the tab; and
+ *   - it averaged in pixels from inside the watermark itself — and wrote its
+ *     own output back into the buffer it was reading — so the watermark was
+ *     smeared across the region rather than removed.
+ *
+ * The interpolation is O(region pixels), allocates nothing per pixel, and
+ * matches the surrounding content exactly at the region border.
  */
 function removeWatermarkFromFrame(
   ctx: CanvasRenderingContext2D,
@@ -323,78 +376,90 @@ function removeWatermarkFromFrame(
   canvasWidth: number,
   canvasHeight: number
 ): void {
-  // Expand region slightly for better blending
+  // Expand region slightly so soft/antialiased watermark edges are covered.
   const padding = WATERMARK_INPAINT_PADDING;
-  const x = Math.max(0, coords.x - padding);
-  const y = Math.max(0, coords.y - padding);
-  const width = Math.min(canvasWidth - x, coords.width + padding * 2);
-  const height = Math.min(canvasHeight - y, coords.height + padding * 2);
+  const x = Math.max(0, Math.round(coords.x) - padding);
+  const y = Math.max(0, Math.round(coords.y) - padding);
+  const width = Math.min(canvasWidth - x, Math.round(coords.width) + padding * 2);
+  const height = Math.min(canvasHeight - y, Math.round(coords.height) + padding * 2);
+  if (width <= 0 || height <= 0) return;
 
-  // Get surrounding pixels for inpainting
-  const sampleSize = WATERMARK_INPAINT_RADIUS + 2;
-  const sampleX = Math.max(0, x - sampleSize);
-  const sampleY = Math.max(0, y - sampleSize);
-  const sampleWidth = Math.min(canvasWidth - sampleX, width + sampleSize * 2);
-  const sampleHeight = Math.min(canvasHeight - sampleY, height + sampleSize * 2);
+  // Read the region plus a one pixel border of clean donor pixels.
+  const readX = Math.max(0, x - 1);
+  const readY = Math.max(0, y - 1);
+  const readW = Math.min(canvasWidth - readX, width + (x - readX) + 1);
+  const readH = Math.min(canvasHeight - readY, height + (y - readY) + 1);
+  if (readW <= 0 || readH <= 0) return;
 
-  // Extract region image data
-  const imageData = ctx.getImageData(sampleX, sampleY, sampleWidth, sampleHeight);
+  const imageData = ctx.getImageData(readX, readY, readW, readH);
   const data = imageData.data;
 
-  // Simple inpainting: average surrounding pixels
-  for (let py = 0; py < height; py++) {
-    for (let px = 0; px < width; px++) {
-      const globalX = x + px - sampleX;
-      const globalY = y + py - sampleY;
-      
-      if (globalX >= 0 && globalX < sampleWidth && globalY >= 0 && globalY < sampleHeight) {
-        const idx = (globalY * sampleWidth + globalX) * 4;
-        
-        // Sample surrounding pixels (excluding watermark region)
-        const samples: number[][] = [];
-        const radius = WATERMARK_INPAINT_RADIUS;
-        
-        for (let sy = -radius; sy <= radius; sy++) {
-          for (let sx = -radius; sx <= radius; sx++) {
-            const sampleX = globalX + sx;
-            const sampleY = globalY + sy;
-            
-            // Skip if outside bounds or in watermark region
-            if (sampleX < 0 || sampleX >= sampleWidth || sampleY < 0 || sampleY >= sampleHeight) {
-              continue;
-            }
-            
-            const sampleIdx = (sampleY * sampleWidth + sampleX) * 4;
-            samples.push([
-              data[sampleIdx],
-              data[sampleIdx + 1],
-              data[sampleIdx + 2],
-              data[sampleIdx + 3],
-            ]);
-          }
-        }
-        
-        if (samples.length > 0) {
-          // Average the samples
-          const avg = samples.reduce(
-            (acc, sample) => [
-              acc[0] + sample[0],
-              acc[1] + sample[1],
-              acc[2] + sample[2],
-              acc[3] + sample[3],
-            ],
-            [0, 0, 0, 0]
-          );
-          
-          data[idx] = avg[0] / samples.length;
-          data[idx + 1] = avg[1] / samples.length;
-          data[idx + 2] = avg[2] / samples.length;
-          data[idx + 3] = avg[3] / samples.length;
-        }
+  // Region position within the buffer we just read.
+  const fx = x - readX;
+  const fy = y - readY;
+
+  // Border rows/columns. A border is unavailable when the region runs to the
+  // edge of the frame; interpolation then uses whichever borders remain.
+  const leftX = fx - 1;
+  const rightX = fx + width;
+  const topY = fy - 1;
+  const botY = fy + height;
+  const hasLeft = leftX >= 0;
+  const hasRight = rightX < readW;
+  const hasTop = topY >= 0;
+  const hasBottom = botY < readH;
+
+  // Nothing clean to sample from (region covers the whole frame).
+  if (!hasLeft && !hasRight && !hasTop && !hasBottom) return;
+
+  const at = (px: number, py: number) => (py * readW + px) * 4;
+
+  for (let j = 0; j < height; j++) {
+    const py = fy + j;
+    const rowLeft = hasLeft ? at(leftX, py) : -1;
+    const rowRight = hasRight ? at(rightX, py) : -1;
+    const dTop = j + 1;
+    const dBottom = height - j;
+
+    for (let i = 0; i < width; i++) {
+      const px = fx + i;
+      const dLeft = i + 1;
+      const dRight = width - i;
+
+      let weight = 0;
+      let r = 0, g = 0, b = 0;
+
+      if (rowLeft >= 0) {
+        const w = 1 / dLeft;
+        weight += w;
+        r += data[rowLeft] * w; g += data[rowLeft + 1] * w; b += data[rowLeft + 2] * w;
       }
+      if (rowRight >= 0) {
+        const w = 1 / dRight;
+        weight += w;
+        r += data[rowRight] * w; g += data[rowRight + 1] * w; b += data[rowRight + 2] * w;
+      }
+      if (hasTop) {
+        const idx = at(px, topY);
+        const w = 1 / dTop;
+        weight += w;
+        r += data[idx] * w; g += data[idx + 1] * w; b += data[idx + 2] * w;
+      }
+      if (hasBottom) {
+        const idx = at(px, botY);
+        const w = 1 / dBottom;
+        weight += w;
+        r += data[idx] * w; g += data[idx + 1] * w; b += data[idx + 2] * w;
+      }
+
+      if (weight === 0) continue;
+      const target = at(px, py);
+      data[target] = r / weight;
+      data[target + 1] = g / weight;
+      data[target + 2] = b / weight;
+      data[target + 3] = 255;
     }
   }
 
-  // Put modified image data back
-  ctx.putImageData(imageData, sampleX, sampleY);
+  ctx.putImageData(imageData, readX, readY);
 }

@@ -649,6 +649,16 @@ function pickReferenceForBox(
   return bestClean ?? bestAny;
 }
 
+/**
+ * Scratch canvas for compositing the donor patch. Reused across frames — a
+ * fresh canvas per frame meant ~30 canvas allocations per second of output in
+ * the hottest loop of the pipeline.
+ */
+const patchScratch: { canvas: HTMLCanvasElement | null; ctx: CanvasRenderingContext2D | null } = {
+  canvas: null,
+  ctx: null,
+};
+
 function patchRegion(
   ctx: CanvasRenderingContext2D,
   maskCtx: CanvasRenderingContext2D,
@@ -689,11 +699,22 @@ function patchRegion(
   }
 
   // Compose the donor patch into a small canvas so we can mask it cheaply.
-  const patchCanvas = document.createElement('canvas');
-  patchCanvas.width = bbox.width;
-  patchCanvas.height = bbox.height;
-  const patchCtx = patchCanvas.getContext('2d');
+  if (!patchScratch.canvas) {
+    patchScratch.canvas = document.createElement('canvas');
+    patchScratch.ctx = patchScratch.canvas.getContext('2d');
+  }
+  const patchCanvas = patchScratch.canvas;
+  const patchCtx = patchScratch.ctx;
   if (!patchCtx) return;
+  // Assigning width/height also resets the canvas, so no explicit clear is
+  // needed when the size changes; clear explicitly when it does not.
+  if (patchCanvas.width !== bbox.width || patchCanvas.height !== bbox.height) {
+    patchCanvas.width = bbox.width;
+    patchCanvas.height = bbox.height;
+  } else {
+    patchCtx.clearRect(0, 0, bbox.width, bbox.height);
+  }
+  patchCtx.globalCompositeOperation = 'source-over';
   patchCtx.drawImage(
     ref.canvas,
     bbox.x, bbox.y, bbox.width, bbox.height,

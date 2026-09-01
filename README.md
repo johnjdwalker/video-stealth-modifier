@@ -95,6 +95,9 @@ This app requires a modern browser with support for:
 | Download result | `Ctrl/Cmd + D`       |
 | Cancel          | `Esc`                |
 
+Shortcuts are ignored while you are typing in a text field, so they never
+interfere with the AI prompt or the preset name input.
+
 ## File Limitations
 
 - **Maximum file size**: 500MB
@@ -129,6 +132,13 @@ This app requires a modern browser with support for:
 - The app will still work without AI features
 
 ## Development
+
+### Type checking
+```bash
+npm run typecheck
+```
+The project uses TypeScript in `strict` mode. `npm run build` runs the type
+checker before bundling, so a type error fails the build rather than shipping.
 
 ### Build for production
 ```bash
