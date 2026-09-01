@@ -4,10 +4,9 @@ A web application for subtly modifying videos with AI-powered suggestions. Adjus
 
 ## Features
 
-- 🪄 **Sora 2 watermark remover**: dedicated tool for the bouncing white logo
-  produced by Sora 2 / ChatGPT video. Tracks the watermark across the whole
-  clip and reconstructs each covered pixel from frames where the watermark
-  was elsewhere — feathered for seamless blending.
+- 🪄 **Sora 2 watermark remover**: dedicated tool for the white logo produced by
+  Sora 2 / ChatGPT video. See [Sora watermark removal](#sora-watermark-removal)
+  below.
 - 🎨 **Visual Adjustments**: Brightness, contrast, saturation, hue rotation
 - 🖼️ **Stylistic Filters**: Blur, sepia, grayscale, vignette
 - ⚡ **Playback Speed**: Adjust video speed (0.5x - 2.0x) with optional pitch preservation
@@ -21,6 +20,64 @@ A web application for subtly modifying videos with AI-powered suggestions. Adjus
 - 📥 **Easy Upload**: Click, drag-and-drop, or paste a video from the clipboard
 - 💾 **Export**: Download modified videos in WEBM (VP8 / VP9) — or MP4 (H.264) on
   browsers that allow it — with selectable bitrate
+
+## Sora watermark removal
+
+The Sora watermark holds one position for a while, fades, and reappears
+somewhere else. The remover models it that way — as a set of **dwells** rather
+than one continuously moving path — and works in four steps.
+
+### 1. Detect
+
+Frames are sampled across the clip and scored for the watermark. Detection
+keys on two signals:
+
+- **Local contrast (white top-hat).** The watermark is a small bright mark laid
+  *on top of* the picture. Subtracting a local mean leaves it standing out
+  while the interior of any large bright region — an overcast sky, a wall, a
+  white phone screen — collapses to roughly nothing. Plain brightness cannot
+  tell those apart; this can.
+- **Persistence.** The watermark holds a position for seconds while the content
+  behind it changes. Transient bright things fail this and are dropped.
+
+On top of those, Sora-specific priors are applied: the mark is small, much
+wider than tall (icon + wordmark), and hugs a frame edge. The icon and the
+letters are joined by a horizontal morphological closing before connected
+components, so `S o r a` is found as one mark rather than four blobs.
+
+### 2. Correct by clicking (optional)
+
+If the amber tracking box is not on the watermark, turn on **Click-to-fix** and
+click the watermark in the video. The click snaps to the mark under the cursor
+and overrides the tracked position for that stretch of the clip; the video
+pauses so the result can be checked against the frame. Corrections are listed
+with their timestamps and can be removed individually.
+
+The timeline strip under the players shows where the watermark sits over the
+duration — detected stretches in indigo, your corrections in green — and can be
+clicked to seek.
+
+### 3. Choose the fill
+
+| Method | What it does | Best for |
+| --- | --- | --- |
+| **Auto** | Borrows real pixels when a clean donor frame exists, inpaints otherwise | Default |
+| **Borrow from frame** | Takes pixels from a moment when the watermark was elsewhere | Still backgrounds — sharpest result |
+| **Inpaint edges** | Rebuilds from the pixels bordering the region | Moving scenes — never ghosts, but softer |
+
+**Preview the fill on the current frame** renders a single before/after crop so
+the methods can be compared without waiting for a full re-encode.
+
+### 4. Remove and export
+
+The clip is re-encoded at high bitrate, preferring MP4/H.264 where the browser's
+`MediaRecorder` allows it and falling back to WEBM (VP9, then VP8). Where
+`requestVideoFrameCallback` is available, the canvas is driven from decoded
+frames and each one is pushed explicitly, so the source frame rate is preserved
+rather than being resampled to a fixed 30fps.
+
+Note that this path re-encodes through a canvas, so it is lossy by nature — the
+bitrate is set high to keep the loss small, not to avoid it.
 
 ## Browser Requirements
 
@@ -132,6 +189,16 @@ interfere with the AI prompt or the preset name input.
 - The app will still work without AI features
 
 ## Development
+
+### Tests
+```bash
+npm test
+```
+Covers the pure logic behind watermark removal: detection against synthetic
+frames that reproduce the known false positives (bright sky, white phone UI,
+transient white chips), dwell clustering, correction/timeline resolution, the
+letterbox coordinate mapping, and the inpainting fill. These are plain Node
+scripts that exit non-zero on failure — no test framework needed.
 
 ### Type checking
 ```bash

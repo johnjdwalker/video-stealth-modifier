@@ -64,12 +64,12 @@ export interface WatermarkRemovalState {
 }
 
 // ----------------------------------------------------------------------------
-// Sora 2 / animated watermark types
+// Sora 2 watermark types
 // ----------------------------------------------------------------------------
 
 /**
  * One sample of the watermark's bounding box at a specific point in time.
- * Used to build a trajectory for moving watermarks (Sora's bouncing logo).
+ * Samples belong to a dwell; they capture the small drift within it.
  */
 export interface SoraWatermarkSample {
   time: number;        // seconds
@@ -78,39 +78,76 @@ export interface SoraWatermarkSample {
 }
 
 /**
- * Full result of running auto-detection against a video. The trajectory is the
- * sorted list of samples; downstream code interpolates between samples.
+ * A stretch of time during which the watermark holds one position.
+ *
+ * Sora's watermark does not travel continuously — it sits in one place, fades,
+ * and reappears somewhere else. Modelling that as dwells rather than a single
+ * interpolated path matters: interpolating between the last sample of one
+ * dwell and the first of the next drags the patched region straight across the
+ * middle of the frame during the hop.
  */
+export interface SoraDwell {
+  startTime: number;
+  endTime: number;
+  /** Stabilised box for the dwell, in source video pixels, before padding. */
+  bbox: WatermarkCoords;
+  /** Per-sample boxes inside this dwell, ascending by time. */
+  samples: SoraWatermarkSample[];
+  confidence: number; // 0-100
+  /** Whether this dwell came from auto-detection or a manual correction. */
+  source: 'auto' | 'manual';
+}
+
+/**
+ * A user correction: "the watermark is *here* at this moment". Overrides the
+ * dwell containing `time`, or creates a manual dwell if it falls in a gap.
+ */
+export interface SoraCorrection {
+  id: string;
+  time: number;
+  bbox: WatermarkCoords;
+}
+
 export interface SoraWatermarkDetection {
   detected: boolean;
   videoWidth: number;
   videoHeight: number;
   videoDuration: number;
-  /** Sorted ascending by `time`. */
-  trajectory: SoraWatermarkSample[];
+  /** Sorted ascending by `startTime`, non-overlapping. */
+  dwells: SoraDwell[];
   /**
-   * Padding (in pixels) to add around each detected box during removal so that
-   * we cover the soft edges and any aliasing of the watermark.
+   * Padding (in pixels) added around each box during removal so we cover the
+   * soft edges and antialiasing of the watermark.
    */
   padding: number;
-  /** Average detection confidence across samples. 0-100. */
+  /** Median watermark size across the clip; seeds manual corrections. */
+  logoSize: { width: number; height: number } | null;
   averageConfidence: number;
-  /** When detection finishes empty-handed, why. */
+  /** How much of the clip is covered by dwells, 0-1. */
+  coverage: number;
+  /** Number of frames sampled during detection. */
+  samplesAnalyzed: number;
   message?: string;
 }
 
 export type SoraRemovalQuality = 'fast' | 'balanced' | 'high';
 
+/**
+ * How the covered region is reconstructed.
+ * - `temporal`: borrow real pixels from a moment when the watermark was elsewhere.
+ * - `inpaint`:  interpolate inward from the clean pixels bordering the region.
+ * - `auto`:     temporal when a clean donor exists, inpaint otherwise.
+ */
+export type SoraFillMode = 'auto' | 'temporal' | 'inpaint';
+
 export interface SoraRemovalState {
   isDetecting: boolean;
   isRemoving: boolean;
   detection: SoraWatermarkDetection | null;
+  corrections: SoraCorrection[];
   progress: number;
   stageMessage: string;
   error: string | null;
   processedVideoUrl: string | null;
   processedMimeType: string | null;
 }
-
-// DEFAULT_VIDEO_SETTINGS is defined and exported from constants.ts
-// and should be imported from there if needed.

@@ -1,106 +1,234 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import VideoUploader from './VideoUploader';
 import VideoInfo from './VideoInfo';
 import DownloadIcon from './icons/DownloadIcon';
 import ProcessingSpinnerIcon from './icons/ProcessingSpinnerIcon';
 import { useSoraWatermarkRemoval } from '../hooks/useSoraWatermarkRemoval';
-import { SoraRemovalQuality, WatermarkCoords } from '../types';
+import { SoraDwell, SoraFillMode, SoraRemovalQuality, WatermarkCoords } from '../types';
+import { boxAtTime, describeMimeType, snapBoxToClick } from '../services/soraWatermarkService';
 
 const QUALITY_OPTIONS: Array<{ value: SoraRemovalQuality; label: string; description: string }> = [
-  { value: 'fast',     label: 'Fast',     description: '4 reference frames. Quickest, less robust on busy backgrounds.' },
-  { value: 'balanced', label: 'Balanced', description: '8 reference frames. Best speed-quality trade-off.' },
-  { value: 'high',     label: 'High',     description: '14 reference frames. Cleanest fill on dynamic scenes (slower).' },
+  { value: 'fast',     label: 'Fast',     description: '4 reference frames — quickest, weaker on busy backgrounds.' },
+  { value: 'balanced', label: 'Balanced', description: '10 reference frames — good speed/quality trade-off.' },
+  { value: 'high',     label: 'High',     description: '18 reference frames — cleanest fill on moving scenes.' },
 ];
 
-interface PlaybackBoxProps {
-  videoSrc: string | null;
-  /** When provided, draws a tracking overlay on top of the playing video. */
-  trajectory?: { time: number; bbox: WatermarkCoords }[];
-  videoWidth?: number;
-  videoHeight?: number;
-  showOverlay?: boolean;
+const FILL_OPTIONS: Array<{ value: SoraFillMode; label: string; description: string }> = [
+  { value: 'auto',     label: 'Auto',              description: 'Borrow real pixels when a clean donor frame exists, otherwise inpaint.' },
+  { value: 'temporal', label: 'Borrow from frame', description: 'Take pixels from a moment when the watermark was elsewhere. Sharpest when the background is still.' },
+  { value: 'inpaint',  label: 'Inpaint edges',     description: 'Rebuild from the surrounding pixels. Never ghosts, but softer over detail.' },
+];
+
+/**
+ * Where the video is actually painted inside its element.
+ *
+ * `object-contain` letterboxes the picture, so the element's own bounding box
+ * is not the picture's box. Measuring against the element is what put the old
+ * tracking overlay out in the black bars on portrait clips.
+ */
+function getContentRect(video: HTMLVideoElement) {
+  const el = video.getBoundingClientRect();
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh || el.width === 0 || el.height === 0) return null;
+  const scale = Math.min(el.width / vw, el.height / vh);
+  const width = vw * scale;
+  const height = vh * scale;
+  return {
+    left: el.left + (el.width - width) / 2,
+    top: el.top + (el.height - height) / 2,
+    width,
+    height,
+    scale,
+  };
 }
 
-/** Plays a video and draws the interpolated watermark bbox over it. */
-const PlaybackWithOverlay: React.FC<PlaybackBoxProps> = ({
-  videoSrc, trajectory, videoWidth, videoHeight, showOverlay,
+function formatTime(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) return '0:00';
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}:${secs.toFixed(1).padStart(4, '0')}`;
+}
+
+interface VideoStageProps {
+  src: string | null;
+  /** Effective dwells, used to draw the tracked region. */
+  dwells?: SoraDwell[];
+  padding?: number;
+  showOverlay?: boolean;
+  /** When set, clicking the picture reports the clicked point in video pixels. */
+  onPickPoint?: (videoX: number, videoY: number, time: number, video: HTMLVideoElement) => void;
+  onTimeUpdate?: (time: number) => void;
+  videoRef?: React.RefObject<HTMLVideoElement | null>;
+  placeholder?: string;
+}
+
+const VideoStage: React.FC<VideoStageProps> = ({
+  src, dwells, padding = 10, showOverlay, onPickPoint, onTimeUpdate, videoRef, placeholder,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const localRef = useRef<HTMLVideoElement>(null);
+  const video = videoRef ?? localRef;
   const overlayRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number>(0);
+  const lastReportedTime = useRef(0);
+  const [aspect, setAspect] = useState<number | null>(null);
 
+  // Drive the overlay from a rAF loop so it tracks playback smoothly.
   useEffect(() => {
-    if (!showOverlay || !trajectory || trajectory.length === 0 || !videoWidth || !videoHeight) return;
     const tick = () => {
-      const v = videoRef.current;
+      const v = video.current;
       const o = overlayRef.current;
       const c = containerRef.current;
-      if (v && o && c && v.videoWidth > 0) {
-        const t = v.currentTime;
-        let lo = 0, hi = trajectory.length - 1;
-        if (t <= trajectory[0].time) { lo = hi = 0; }
-        else if (t >= trajectory[hi].time) { lo = hi; }
-        else {
-          while (hi - lo > 1) { const m = (lo + hi) >> 1; if (trajectory[m].time <= t) lo = m; else hi = m; }
-        }
-        const a = trajectory[lo], b = trajectory[hi];
-        const span = Math.max(1e-6, b.time - a.time);
-        const u = lo === hi ? 0 : Math.max(0, Math.min(1, (t - a.time) / span));
-        const bx = a.bbox.x + (b.bbox.x - a.bbox.x) * u;
-        const by = a.bbox.y + (b.bbox.y - a.bbox.y) * u;
-        const bw = a.bbox.width + (b.bbox.width - a.bbox.width) * u;
-        const bh = a.bbox.height + (b.bbox.height - a.bbox.height) * u;
-
-        const rect = v.getBoundingClientRect();
-        const cRect = c.getBoundingClientRect();
-        const sx = rect.width / videoWidth;
-        const sy = rect.height / videoHeight;
-        o.style.left = `${rect.left - cRect.left + bx * sx}px`;
-        o.style.top = `${rect.top - cRect.top + by * sy}px`;
-        o.style.width = `${bw * sx}px`;
-        o.style.height = `${bh * sy}px`;
-        o.style.display = 'block';
-      } else if (o) {
-        o.style.display = 'none';
-      }
       rafRef.current = requestAnimationFrame(tick);
+      if (!v || !c) return;
+      // The overlay itself is repositioned every frame, but reporting the time
+      // upward that often would re-render the whole panel 60 times a second.
+      // A playhead does not need better than ~10Hz.
+      if (onTimeUpdate && Math.abs(v.currentTime - lastReportedTime.current) > 0.1) {
+        lastReportedTime.current = v.currentTime;
+        onTimeUpdate(v.currentTime);
+      }
+      if (!o) return;
+
+      if (!showOverlay || !dwells || dwells.length === 0 || !v.videoWidth) {
+        o.style.display = 'none';
+        return;
+      }
+      const box = boxAtTime(dwells, v.currentTime, padding, v.videoWidth, v.videoHeight);
+      const content = getContentRect(v);
+      if (!box || !content) { o.style.display = 'none'; return; }
+
+      const cRect = c.getBoundingClientRect();
+      o.style.left = `${content.left - cRect.left + box.x * content.scale}px`;
+      o.style.top = `${content.top - cRect.top + box.y * content.scale}px`;
+      o.style.width = `${box.width * content.scale}px`;
+      o.style.height = `${box.height * content.scale}px`;
+      o.style.display = 'block';
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [showOverlay, trajectory, videoWidth, videoHeight]);
+  }, [showOverlay, dwells, padding, onTimeUpdate, video]);
 
-  if (!videoSrc) {
+  const handleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!onPickPoint) return;
+    const v = video.current;
+    if (!v || !v.videoWidth) return;
+    const content = getContentRect(v);
+    if (!content) return;
+    const x = (e.clientX - content.left) / content.scale;
+    const y = (e.clientY - content.top) / content.scale;
+    // Ignore clicks that land in the letterbox rather than on the picture.
+    if (x < 0 || y < 0 || x > v.videoWidth || y > v.videoHeight) return;
+    onPickPoint(x, y, v.currentTime, v);
+  }, [onPickPoint, video]);
+
+  if (!src) {
     return (
       <div className="w-full aspect-video bg-gray-800 rounded-lg flex items-center justify-center text-gray-500">
-        <p>Loading preview…</p>
+        <p>{placeholder ?? 'Loading preview…'}</p>
       </div>
     );
   }
 
   return (
-    <div ref={containerRef} className="relative w-full aspect-video bg-black rounded-lg overflow-hidden shadow-xl">
+    <div
+      ref={containerRef}
+      className="relative w-full bg-black rounded-lg overflow-hidden shadow-xl mx-auto"
+      style={{ aspectRatio: aspect ? `${aspect}` : '16 / 9', maxHeight: '58vh' }}
+    >
       <video
-        ref={videoRef}
-        src={videoSrc}
+        ref={video}
+        src={src}
         controls
         loop
         autoPlay
         muted
+        playsInline
+        onLoadedMetadata={(e) => {
+          const el = e.currentTarget;
+          if (el.videoWidth && el.videoHeight) setAspect(el.videoWidth / el.videoHeight);
+        }}
         className="w-full h-full object-contain"
       />
-      {showOverlay && (
+      {onPickPoint && (
+        // Transparent hit layer above the picture but below the native controls
+        // strip, so scrubbing still works while placing corrections.
         <div
-          ref={overlayRef}
-          aria-hidden="true"
-          className="pointer-events-none absolute hidden"
-          style={{
-            border: '2px solid #f59e0b',
-            backgroundColor: 'rgba(245, 158, 11, 0.18)',
-            zIndex: 10,
-          }}
+          onClick={handleClick}
+          className="absolute inset-x-0 top-0 cursor-crosshair"
+          style={{ bottom: '3.5rem', zIndex: 15 }}
+          aria-label="Click the watermark to correct its position"
         />
       )}
+      <div
+        ref={overlayRef}
+        aria-hidden="true"
+        className="pointer-events-none absolute hidden rounded-sm"
+        style={{
+          border: '2px solid #f59e0b',
+          backgroundColor: 'rgba(245, 158, 11, 0.16)',
+          boxShadow: '0 0 0 1px rgba(0,0,0,0.6)',
+          zIndex: 10,
+        }}
+      />
+    </div>
+  );
+};
+
+/** Horizontal map of where the watermark sits over the clip's duration. */
+const DwellTimeline: React.FC<{
+  dwells: SoraDwell[];
+  duration: number;
+  currentTime: number;
+  corrections: { id: string; time: number }[];
+  onSeek: (time: number) => void;
+}> = ({ dwells, duration, currentTime, corrections, onSeek }) => {
+  if (duration <= 0) return null;
+  const pct = (t: number) => `${Math.max(0, Math.min(100, (t / duration) * 100))}%`;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between text-xs text-gray-400 mb-1">
+        <span>Watermark positions over time</span>
+        <span>{formatTime(currentTime)} / {formatTime(duration)}</span>
+      </div>
+      <div
+        className="relative h-8 w-full bg-gray-900 rounded-md border border-gray-700 overflow-hidden cursor-pointer"
+        onClick={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          onSeek(((e.clientX - rect.left) / rect.width) * duration);
+        }}
+        role="presentation"
+      >
+        {dwells.map((dwell, i) => (
+          <div
+            key={`${dwell.startTime}-${i}`}
+            className={`absolute top-0 bottom-0 border-r border-gray-900 ${
+              dwell.source === 'manual' ? 'bg-emerald-600/70' : 'bg-indigo-600/60'
+            }`}
+            style={{ left: pct(dwell.startTime), width: pct(dwell.endTime - dwell.startTime) }}
+            title={`${dwell.source === 'manual' ? 'Manual' : 'Detected'} · ${formatTime(dwell.startTime)}–${formatTime(dwell.endTime)} · ${dwell.confidence}% confidence`}
+          />
+        ))}
+        {corrections.map((c) => (
+          <div
+            key={c.id}
+            className="absolute top-0 bottom-0 w-0.5 bg-emerald-300"
+            style={{ left: pct(c.time) }}
+            title={`Your correction at ${formatTime(c.time)}`}
+          />
+        ))}
+        <div
+          className="absolute top-0 bottom-0 w-0.5 bg-white"
+          style={{ left: pct(currentTime) }}
+        />
+      </div>
+      <div className="flex gap-4 mt-1 text-[11px] text-gray-500">
+        <span className="flex items-center gap-1"><span className="inline-block w-3 h-2 bg-indigo-600/60 rounded-sm" /> detected</span>
+        <span className="flex items-center gap-1"><span className="inline-block w-3 h-2 bg-emerald-600/70 rounded-sm" /> your correction</span>
+        <span>click to seek</span>
+      </div>
     </div>
   );
 };
@@ -111,12 +239,18 @@ const SoraWatermarkRemover: React.FC = () => {
   const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
   const [fileError, setFileError] = useState<string | null>(null);
   const [quality, setQuality] = useState<SoraRemovalQuality>('balanced');
-  const [manualMode, setManualMode] = useState(false);
-  const [manualRegion, setManualRegion] = useState<WatermarkCoords>({
-    x: 20, y: 20, width: 200, height: 80,
-  });
+  const [fillMode, setFillMode] = useState<SoraFillMode>('auto');
+  const [correcting, setCorrecting] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [lastAction, setLastAction] = useState<string | null>(null);
 
-  const { state, detect, remove, cancelDetection, cancelRemoval, reset } = useSoraWatermarkRemoval();
+  const sourceVideoRef = useRef<HTMLVideoElement>(null);
+
+  const {
+    state, timeline, preview, isPreviewing,
+    detect, remove, addCorrection, removeCorrection, clearCorrections,
+    previewFill, clearPreview, cancelDetection, cancelRemoval, reset,
+  } = useSoraWatermarkRemoval();
 
   useEffect(() => {
     if (!videoFile) { setPreviewUrl(null); return; }
@@ -129,21 +263,20 @@ const SoraWatermarkRemover: React.FC = () => {
     setVideoFile(file);
     setFileError(null);
     setVideoDuration(undefined);
+    setCorrecting(false);
+    setCurrentTime(0);
+    setLastAction(null);
     reset();
 
     const probe = document.createElement('video');
+    const probeUrl = URL.createObjectURL(file);
     probe.preload = 'metadata';
     probe.onloadedmetadata = () => {
       if (isFinite(probe.duration)) setVideoDuration(probe.duration);
-      // Seed manual region to a corner-ish default sized to the video.
-      if (probe.videoWidth && probe.videoHeight) {
-        const w = Math.round(probe.videoWidth * 0.12);
-        const h = Math.round(probe.videoHeight * 0.06);
-        setManualRegion({ x: 24, y: 24, width: Math.max(80, w), height: Math.max(40, h) });
-      }
-      URL.revokeObjectURL(probe.src);
+      URL.revokeObjectURL(probeUrl);
     };
-    probe.src = URL.createObjectURL(file);
+    probe.onerror = () => URL.revokeObjectURL(probeUrl);
+    probe.src = probeUrl;
   };
 
   const handleFileError = (error: string) => {
@@ -155,37 +288,44 @@ const SoraWatermarkRemover: React.FC = () => {
   const handleUploadDifferent = () => {
     setVideoFile(null);
     setFileError(null);
+    setCorrecting(false);
     reset();
   };
 
-  const handleDetect = () => {
-    if (!videoFile) return;
-    detect(videoFile, manualMode ? manualRegion : undefined);
-  };
+  const handlePickPoint = useCallback((x: number, y: number, time: number, video: HTMLVideoElement) => {
+    // Pause so the placed box can be checked against the frame it was set on.
+    video.pause();
+    const box: WatermarkCoords = snapBoxToClick(video, x, y, state.detection?.logoSize ?? null);
+    addCorrection(time, box);
+    clearPreview();
+    setLastAction(`Watermark position set at ${formatTime(time)}.`);
+  }, [addCorrection, clearPreview, state.detection]);
 
-  const handleRemove = () => {
-    if (!videoFile) return;
-    remove(videoFile, quality);
-  };
+  const seekTo = useCallback((time: number) => {
+    const v = sourceVideoRef.current;
+    if (v) v.currentTime = Math.max(0, Math.min(time, v.duration || time));
+  }, []);
 
   const detection = state.detection;
+  const busy = state.isDetecting || state.isRemoving;
+  const hasTimeline = timeline.length > 0;
+
   const downloadName = useMemo(() => {
     const base = videoFile?.name.replace(/\.[^.]+$/, '') || 'video';
     const ext = state.processedMimeType?.includes('mp4') ? 'mp4' : 'webm';
     return `sora_clean_${base}.${ext}`;
   }, [videoFile, state.processedMimeType]);
 
-  const busy = state.isDetecting || state.isRemoving;
+  const currentBox = useMemo(() => {
+    if (!hasTimeline || !detection) return null;
+    return boxAtTime(timeline, currentTime, detection.padding, detection.videoWidth, detection.videoHeight);
+  }, [hasTimeline, timeline, currentTime, detection]);
 
   return (
     <div className="w-full space-y-6">
       {!videoFile ? (
         <>
-          <VideoUploader
-            onFileSelect={handleFileSelect}
-            onFileError={handleFileError}
-            disabled={busy}
-          />
+          <VideoUploader onFileSelect={handleFileSelect} onFileError={handleFileError} disabled={busy} />
           {fileError && (
             <div className="bg-red-700 p-4 rounded-lg text-red-100">
               <p className="font-semibold">File Upload Error:</p>
@@ -193,35 +333,55 @@ const SoraWatermarkRemover: React.FC = () => {
             </div>
           )}
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 text-sm text-gray-300">
-            <p className="font-semibold text-gray-100 mb-2">What this does</p>
-            <ul className="list-disc ml-5 space-y-1 text-gray-400">
-              <li>Targets the bouncing white logo from <span className="text-white">Sora 2 / ChatGPT video</span> (and similar moving overlays).</li>
-              <li>Tracks the watermark across the whole clip, then reconstructs each covered pixel from another moment in the video where the watermark wasn't there.</li>
-              <li>Edges of the patched region are feathered for seamless blending.</li>
-              <li>Works entirely in your browser — no upload, no server.</li>
-            </ul>
+            <p className="font-semibold text-gray-100 mb-2">How this works</p>
+            <ol className="list-decimal ml-5 space-y-1 text-gray-400">
+              <li><span className="text-gray-200">Detect</span> — the clip is sampled and the watermark is tracked as a set of positions it holds over time.</li>
+              <li><span className="text-gray-200">Correct</span> — if a position is wrong, click the watermark on the video and your click wins for that stretch.</li>
+              <li><span className="text-gray-200">Preview the fill</span> — compare fill methods on a single frame before committing to a full re-encode.</li>
+              <li><span className="text-gray-200">Remove</span> — the clip is rebuilt at high bitrate, MP4 where the browser allows it.</li>
+            </ol>
+            <p className="text-gray-500 mt-2">Everything runs in your browser. Nothing is uploaded.</p>
           </div>
         </>
       ) : (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div>
-              <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Original (with tracking overlay)</h4>
-              <PlaybackWithOverlay
-                videoSrc={previewUrl}
-                trajectory={detection?.trajectory}
-                videoWidth={detection?.videoWidth}
-                videoHeight={detection?.videoHeight}
-                showOverlay={!!detection?.detected}
+              <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">
+                Original {hasTimeline && <span className="text-sm font-normal text-amber-400">· tracked region shown</span>}
+              </h4>
+              <VideoStage
+                src={previewUrl}
+                dwells={timeline}
+                padding={detection?.padding ?? 10}
+                showOverlay={hasTimeline}
+                onPickPoint={correcting ? handlePickPoint : undefined}
+                onTimeUpdate={setCurrentTime}
+                videoRef={sourceVideoRef}
               />
             </div>
             <div>
               <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">
-                {state.processedVideoUrl ? 'Watermark Removed' : 'Result'}
+                {state.processedVideoUrl ? 'Watermark removed' : 'Result'}
               </h4>
-              <PlaybackWithOverlay videoSrc={state.processedVideoUrl ?? previewUrl} />
+              <VideoStage
+                src={state.processedVideoUrl}
+                placeholder="Run removal to see the result here"
+              />
             </div>
           </div>
+
+          {hasTimeline && videoDuration !== undefined && (
+            <div className="bg-gray-800 p-4 rounded-lg shadow-lg">
+              <DwellTimeline
+                dwells={timeline}
+                duration={videoDuration}
+                currentTime={currentTime}
+                corrections={state.corrections}
+                onSeek={seekTo}
+              />
+            </div>
+          )}
 
           <VideoInfo
             fileName={videoFile.name}
@@ -230,48 +390,22 @@ const SoraWatermarkRemover: React.FC = () => {
             duration={videoDuration}
           />
 
-          {/* Detection controls */}
-          <div className="bg-gray-800 p-6 rounded-lg shadow-lg space-y-4">
+          <div className="bg-gray-800 p-6 rounded-lg shadow-lg space-y-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h3 className="text-xl font-semibold text-gray-100">Sora Watermark Removal</h3>
-              <label className="flex items-center gap-2 text-sm text-gray-300">
-                <input
-                  type="checkbox"
-                  checked={manualMode}
-                  onChange={(e) => setManualMode(e.target.checked)}
-                  disabled={busy}
-                  className="accent-indigo-500"
-                />
-                Manual region
-              </label>
+              <button
+                onClick={handleUploadDifferent}
+                disabled={busy}
+                className="px-3 py-1.5 text-sm rounded-md bg-yellow-600 hover:bg-yellow-700 text-white font-medium transition-colors disabled:opacity-50"
+              >
+                Upload different video
+              </button>
             </div>
 
-            {manualMode && (
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-3 bg-gray-900 rounded-md border border-gray-700">
-                {(['x', 'y', 'width', 'height'] as const).map((key) => (
-                  <label key={key} className="text-xs text-gray-300">
-                    <span className="block mb-1 capitalize">{key}</span>
-                    <input
-                      type="number"
-                      value={manualRegion[key]}
-                      onChange={(e) => setManualRegion({
-                        ...manualRegion,
-                        [key]: Math.max(0, parseInt(e.target.value, 10) || 0),
-                      })}
-                      disabled={busy}
-                      className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-gray-100 disabled:opacity-50"
-                    />
-                  </label>
-                ))}
-                <p className="col-span-2 sm:col-span-4 text-xs text-gray-500">
-                  Coordinates are in source video pixels. Skip auto-detection and use this exact region.
-                </p>
-              </div>
-            )}
-
+            {/* Step 1 — detect */}
             <div className="flex flex-col sm:flex-row gap-3">
               <button
-                onClick={handleDetect}
+                onClick={() => videoFile && detect(videoFile)}
                 disabled={busy}
                 className="flex-1 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
               >
@@ -280,48 +414,150 @@ const SoraWatermarkRemover: React.FC = () => {
                     <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
                     {state.stageMessage || 'Detecting…'} ({state.progress}%)
                   </>
-                ) : manualMode ? 'Use Manual Region' : 'Detect Sora Watermark'}
+                ) : detection ? 'Re-run detection' : '1. Detect Sora watermark'}
               </button>
               {state.isDetecting && (
                 <button
                   onClick={cancelDetection}
-                  className="px-4 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200"
+                  className="px-4 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg shadow-md transition-colors"
                 >
                   Cancel
                 </button>
               )}
             </div>
 
-            {state.isDetecting && (
-              <div className="w-full bg-gray-700 rounded-full h-2.5">
-                <div className="bg-indigo-500 h-2.5 rounded-full transition-all duration-300" style={{ width: `${state.progress}%` }} />
+            {detection && detection.detected && (
+              <div className="bg-gray-900 border border-emerald-700 rounded-lg p-4 text-sm">
+                <p className="text-emerald-300 font-semibold mb-2">
+                  Tracked {detection.dwells.length} position{detection.dwells.length === 1 ? '' : 's'}
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-gray-300">
+                  <div><span className="block text-xs text-gray-500">Frames analysed</span>{detection.samplesAnalyzed}</div>
+                  <div><span className="block text-xs text-gray-500">Confidence</span>{detection.averageConfidence}%</div>
+                  <div><span className="block text-xs text-gray-500">Clip covered</span>{Math.round(detection.coverage * 100)}%</div>
+                  <div>
+                    <span className="block text-xs text-gray-500">Mark size</span>
+                    {detection.logoSize ? `${detection.logoSize.width}×${detection.logoSize.height}px` : '—'}
+                  </div>
+                </div>
               </div>
             )}
 
-            {detection && !state.isDetecting && (
-              <div className={`p-4 rounded-lg ${detection.detected ? 'bg-emerald-900 border-2 border-emerald-500' : 'bg-blue-900 border-2 border-blue-500'}`}>
-                <h4 className="font-semibold text-lg mb-2">
-                  {detection.detected ? '✓ Trajectory locked' : 'No moving watermark found'}
-                </h4>
-                {detection.detected ? (
-                  <ul className="text-sm space-y-1 text-emerald-100">
-                    <li>Samples tracked: {detection.trajectory.length}</li>
-                    <li>Average confidence: {detection.averageConfidence}%</li>
-                    <li>Frame size: {detection.videoWidth} × {detection.videoHeight}</li>
-                  </ul>
+            {/* Step 2 — correct */}
+            <div className="border-t border-gray-700 pt-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-2">
+                <h4 className="font-semibold text-gray-100">2. Fix the position (optional)</h4>
+                <button
+                  onClick={() => { setCorrecting(!correcting); setLastAction(null); }}
+                  disabled={busy}
+                  className={`px-4 py-2 text-sm font-semibold rounded-lg transition-colors disabled:opacity-50 ${
+                    correcting ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  }`}
+                >
+                  {correcting ? 'Click-to-fix: ON' : 'Click-to-fix: OFF'}
+                </button>
+              </div>
+              <p className="text-sm text-gray-400">
+                {correcting
+                  ? 'Click directly on the watermark in the video. The click snaps to the mark under your cursor and overrides the tracked position for that stretch of the clip. The video pauses so you can check the box.'
+                  : 'Turn this on if the amber box is not sitting on the watermark, then click the watermark in the video to correct it.'}
+              </p>
+              {lastAction && <p className="text-sm text-emerald-400 mt-2" role="status">{lastAction}</p>}
+
+              {state.corrections.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {state.corrections
+                    .slice()
+                    .sort((a, b) => a.time - b.time)
+                    .map((c) => (
+                      <div key={c.id} className="flex items-center gap-2 text-sm bg-gray-900 border border-gray-700 rounded-md px-3 py-2">
+                        <button
+                          onClick={() => seekTo(c.time)}
+                          className="text-emerald-300 hover:text-emerald-200 font-mono"
+                        >
+                          {formatTime(c.time)}
+                        </button>
+                        <span className="text-gray-500 text-xs">
+                          {c.bbox.width}×{c.bbox.height} at ({c.bbox.x}, {c.bbox.y})
+                        </span>
+                        <button
+                          onClick={() => removeCorrection(c.id)}
+                          disabled={busy}
+                          className="ml-auto px-2 py-1 text-xs bg-red-700 hover:bg-red-600 text-white rounded disabled:opacity-50"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                  <button
+                    onClick={clearCorrections}
+                    disabled={busy}
+                    className="text-xs text-gray-400 hover:text-gray-200 underline disabled:opacity-50"
+                  >
+                    Clear all corrections
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Step 3 — fill method + preview */}
+            <div className="border-t border-gray-700 pt-4">
+              <h4 className="font-semibold text-gray-100 mb-2">3. Choose how the area is filled</h4>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                {FILL_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    onClick={() => { setFillMode(opt.value); clearPreview(); }}
+                    disabled={busy}
+                    className={`text-left p-3 rounded-lg border transition-colors disabled:opacity-50 ${
+                      fillMode === opt.value
+                        ? 'border-indigo-500 bg-indigo-600/20'
+                        : 'border-gray-700 bg-gray-900 hover:border-gray-600'
+                    }`}
+                  >
+                    <div className="font-semibold text-sm text-gray-100">{opt.label}</div>
+                    <div className="text-xs text-gray-400 mt-1">{opt.description}</div>
+                  </button>
+                ))}
+              </div>
+
+              <button
+                onClick={() => videoFile && previewFill(videoFile, currentTime, fillMode)}
+                disabled={busy || isPreviewing || !hasTimeline}
+                className="mt-3 w-full px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-100 font-semibold rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+              >
+                {isPreviewing ? (
+                  <><ProcessingSpinnerIcon className="w-4 h-4 mr-2" /> Rendering preview…</>
                 ) : (
-                  <p className="text-sm text-blue-100">{detection.message}</p>
+                  `Preview this fill on the current frame (${formatTime(currentTime)})`
                 )}
-              </div>
-            )}
+              </button>
 
-            {/* Quality + run */}
-            {detection?.detected && (
-              <div className="space-y-3 pt-3 border-t border-gray-700">
+              {preview && (
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  <figure>
+                    <figcaption className="text-xs text-gray-400 mb-1 text-center">Before</figcaption>
+                    <img src={preview.beforeUrl} alt="Region before removal" className="w-full rounded-md border border-gray-700 bg-black" />
+                  </figure>
+                  <figure>
+                    <figcaption className="text-xs text-gray-400 mb-1 text-center">After ({FILL_OPTIONS.find((o) => o.value === fillMode)?.label})</figcaption>
+                    <img src={preview.afterUrl} alt="Region after removal" className="w-full rounded-md border border-emerald-700 bg-black" />
+                  </figure>
+                </div>
+              )}
+              {currentBox && (
+                <p className="text-xs text-gray-500 mt-2">
+                  Region at this moment: {currentBox.width}×{currentBox.height}px at ({currentBox.x}, {currentBox.y}).
+                </p>
+              )}
+            </div>
+
+            {/* Step 4 — remove */}
+            <div className="border-t border-gray-700 pt-4 space-y-3">
+              <h4 className="font-semibold text-gray-100">4. Remove and export</h4>
+              {fillMode !== 'inpaint' && (
                 <div>
-                  <label htmlFor="soraQuality" className="block text-sm font-medium text-gray-300 mb-1">
-                    Reconstruction quality
-                  </label>
+                  <label htmlFor="soraQuality" className="block text-sm text-gray-300 mb-1">Reference frames</label>
                   <select
                     id="soraQuality"
                     value={quality}
@@ -329,74 +565,71 @@ const SoraWatermarkRemover: React.FC = () => {
                     disabled={busy}
                     className="w-full p-2 bg-gray-700 border border-gray-600 rounded-md text-gray-100 disabled:opacity-50"
                   >
-                    {QUALITY_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>{opt.label} — {opt.description}</option>
+                    {QUALITY_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label} — {o.description}</option>
                     ))}
                   </select>
                 </div>
+              )}
 
-                <div className="flex flex-col sm:flex-row gap-3">
-                  <button
-                    onClick={handleRemove}
-                    disabled={busy}
-                    className="flex-1 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {state.isRemoving ? (
-                      <>
-                        <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
-                        {state.stageMessage || 'Removing…'} ({state.progress}%)
-                      </>
-                    ) : 'Remove Watermark'}
-                  </button>
-                  {state.isRemoving && (
-                    <button
-                      onClick={cancelRemoval}
-                      className="px-4 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200"
-                    >
-                      Cancel
-                    </button>
-                  )}
-                </div>
-
+              <div className="flex flex-col sm:flex-row gap-3">
+                <button
+                  onClick={() => videoFile && remove(videoFile, quality, fillMode)}
+                  disabled={busy || !hasTimeline}
+                  className="flex-1 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {state.isRemoving ? (
+                    <>
+                      <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
+                      {state.stageMessage || 'Removing…'} ({state.progress}%)
+                    </>
+                  ) : 'Remove watermark'}
+                </button>
                 {state.isRemoving && (
-                  <div className="w-full bg-gray-700 rounded-full h-2.5">
-                    <div className="bg-emerald-500 h-2.5 rounded-full transition-all duration-300" style={{ width: `${state.progress}%` }} />
-                  </div>
+                  <button
+                    onClick={cancelRemoval}
+                    className="px-4 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg shadow-md transition-colors"
+                  >
+                    Cancel
+                  </button>
                 )}
               </div>
-            )}
+
+              {state.isRemoving && (
+                <div className="w-full bg-gray-700 rounded-full h-2.5">
+                  <div className="bg-emerald-500 h-2.5 rounded-full transition-all duration-300" style={{ width: `${state.progress}%` }} />
+                </div>
+              )}
+
+              {!hasTimeline && !state.isDetecting && (
+                <p className="text-sm text-gray-400">
+                  Run detection first — or turn on click-to-fix and click the watermark to place it yourself.
+                </p>
+              )}
+            </div>
 
             {state.error && (
-              <div className="bg-red-700 p-4 rounded-lg text-red-100">
-                <p className="font-semibold">Error:</p>
-                <p className="text-sm">{state.error}</p>
+              <div className="bg-red-900/60 border border-red-700 p-4 rounded-lg text-red-100 text-sm" role="alert">
+                {state.error}
               </div>
             )}
 
             {state.processedVideoUrl && !state.isRemoving && (
-              <div className="bg-emerald-700 p-4 rounded-lg">
-                <h4 className="text-lg font-semibold text-emerald-100 mb-2">Watermark removed!</h4>
-                <p className="text-sm text-emerald-200 mb-3">
-                  Your processed video is ready ({state.processedMimeType?.includes('mp4') ? 'MP4' : 'WEBM'}).
+              <div className="bg-green-700 p-5 rounded-lg shadow-lg">
+                <h4 className="text-lg font-semibold text-green-100 mb-1">Ready</h4>
+                <p className="text-sm text-green-200 mb-3">
+                  Exported as {describeMimeType(state.processedMimeType)} at high bitrate.
                 </p>
                 <a
                   href={state.processedVideoUrl}
                   download={downloadName}
-                  className="w-full px-6 py-3 bg-emerald-500 hover:bg-emerald-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200"
+                  className="w-full px-6 py-3 bg-green-500 hover:bg-green-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors"
                 >
                   <DownloadIcon className="w-5 h-5 mr-2" />
-                  Download Clean Video
+                  Download cleaned video
                 </a>
               </div>
             )}
-
-            <button
-              onClick={handleUploadDifferent}
-              disabled={busy}
-              className="w-full px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200 disabled:opacity-50"
-            >
-              Upload Different Video
-            </button>
           </div>
         </>
       )}

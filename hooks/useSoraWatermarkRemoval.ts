@@ -1,11 +1,24 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { SoraRemovalQuality, SoraRemovalState, WatermarkCoords } from '../types';
-import { detectSoraWatermark, removeSoraWatermark } from '../services/soraWatermarkService';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  SoraCorrection,
+  SoraFillMode,
+  SoraRemovalQuality,
+  SoraRemovalState,
+  WatermarkCoords,
+} from '../types';
+import {
+  detectSoraWatermark,
+  removeSoraWatermark,
+  renderFillPreview,
+  resolveTimeline,
+  FillPreview,
+} from '../services/soraWatermarkService';
 
 const INITIAL_STATE: SoraRemovalState = {
   isDetecting: false,
   isRemoving: false,
   detection: null,
+  corrections: [],
   progress: 0,
   stageMessage: '',
   error: null,
@@ -13,10 +26,16 @@ const INITIAL_STATE: SoraRemovalState = {
   processedMimeType: null,
 };
 
+let correctionSeq = 0;
+
 export function useSoraWatermarkRemoval() {
   const [state, setState] = useState<SoraRemovalState>(INITIAL_STATE);
+  const [preview, setPreview] = useState<FillPreview | null>(null);
+  const [isPreviewing, setIsPreviewing] = useState(false);
+
   const detectAbortRef = useRef<AbortController | null>(null);
   const removeAbortRef = useRef<AbortController | null>(null);
+  const previewAbortRef = useRef<AbortController | null>(null);
 
   // Revoke the processed object URL when it changes or unmounts.
   useEffect(() => {
@@ -26,7 +45,23 @@ export function useSoraWatermarkRemoval() {
     };
   }, [state.processedVideoUrl]);
 
-  const detect = useCallback(async (file: File, manualRegion?: WatermarkCoords) => {
+  useEffect(() => () => {
+    detectAbortRef.current?.abort();
+    removeAbortRef.current?.abort();
+    previewAbortRef.current?.abort();
+  }, []);
+
+  /** Detected dwells with the user's corrections applied. */
+  const timeline = useMemo(
+    () => resolveTimeline(
+      state.detection,
+      state.corrections,
+      state.detection?.videoDuration ?? 0
+    ),
+    [state.detection, state.corrections]
+  );
+
+  const detect = useCallback(async (file: File) => {
     detectAbortRef.current?.abort();
     const ac = new AbortController();
     detectAbortRef.current = ac;
@@ -35,24 +70,22 @@ export function useSoraWatermarkRemoval() {
       ...prev,
       isDetecting: true,
       detection: null,
+      corrections: [],
       error: null,
       progress: 0,
-      stageMessage: 'Sampling frames…',
+      stageMessage: 'Analysing frames…',
     }));
 
     try {
-      const detection = await detectSoraWatermark(
-        file,
-        (progress, stage) => {
-          if (ac.signal.aborted) return;
-          setState((prev) => ({
-            ...prev,
-            progress: Math.round(progress),
-            stageMessage: stage ?? prev.stageMessage,
-          }));
-        },
-        { manualRegion, signal: ac.signal }
-      );
+      const detection = await detectSoraWatermark(file, (progress, stage) => {
+        if (ac.signal.aborted) return;
+        setState((prev) => ({
+          ...prev,
+          progress: Math.round(progress),
+          stageMessage: stage ?? prev.stageMessage,
+        }));
+      }, { signal: ac.signal });
+
       if (ac.signal.aborted) return;
       setState((prev) => ({
         ...prev,
@@ -73,9 +106,62 @@ export function useSoraWatermarkRemoval() {
     }
   }, []);
 
-  const remove = useCallback(async (file: File, quality: SoraRemovalQuality = 'balanced') => {
-    if (!state.detection?.detected || state.detection.trajectory.length === 0) {
-      setState((prev) => ({ ...prev, error: 'Run detection first or set a manual region.' }));
+  /**
+   * Records "the watermark is here at this moment". Overrides the detected
+   * position for the stretch of timeline containing `time`.
+   */
+  const addCorrection = useCallback((time: number, bbox: WatermarkCoords) => {
+    const correction: SoraCorrection = { id: `c${++correctionSeq}`, time, bbox };
+    setState((prev) => {
+      // One correction per dwell: replace any existing correction close in time.
+      const kept = prev.corrections.filter((c) => Math.abs(c.time - time) > 0.001);
+      return { ...prev, corrections: [...kept, correction], error: null };
+    });
+    return correction;
+  }, []);
+
+  const removeCorrection = useCallback((id: string) => {
+    setState((prev) => ({ ...prev, corrections: prev.corrections.filter((c) => c.id !== id) }));
+  }, []);
+
+  const clearCorrections = useCallback(() => {
+    setState((prev) => ({ ...prev, corrections: [] }));
+  }, []);
+
+  /** Renders a single frame with the chosen fill, for side-by-side comparison. */
+  const previewFill = useCallback(async (file: File, time: number, fillMode: SoraFillMode) => {
+    if (timeline.length === 0) return;
+    previewAbortRef.current?.abort();
+    const ac = new AbortController();
+    previewAbortRef.current = ac;
+    setIsPreviewing(true);
+    try {
+      const result = await renderFillPreview(
+        file, time, timeline, state.detection?.padding ?? 10, fillMode, { signal: ac.signal }
+      );
+      if (!ac.signal.aborted) setPreview(result);
+    } catch (err: any) {
+      if (!ac.signal.aborted) {
+        setState((prev) => ({ ...prev, error: err?.message || 'Could not render preview.' }));
+      }
+    } finally {
+      if (!ac.signal.aborted) setIsPreviewing(false);
+    }
+  }, [timeline, state.detection]);
+
+  const clearPreview = useCallback(() => {
+    previewAbortRef.current?.abort();
+    setPreview(null);
+    setIsPreviewing(false);
+  }, []);
+
+  const remove = useCallback(async (
+    file: File,
+    quality: SoraRemovalQuality = 'balanced',
+    fillMode: SoraFillMode = 'auto'
+  ) => {
+    if (timeline.length === 0) {
+      setState((prev) => ({ ...prev, error: 'Run detection, or click the watermark to place it manually.' }));
       return;
     }
     removeAbortRef.current?.abort();
@@ -86,7 +172,7 @@ export function useSoraWatermarkRemoval() {
       ...prev,
       isRemoving: true,
       progress: 0,
-      stageMessage: 'Preparing reconstruction…',
+      stageMessage: 'Preparing…',
       error: null,
       processedVideoUrl: null,
       processedMimeType: null,
@@ -95,7 +181,8 @@ export function useSoraWatermarkRemoval() {
     try {
       const { blob, mimeType } = await removeSoraWatermark(
         file,
-        state.detection,
+        timeline,
+        state.detection?.padding ?? 10,
         (progress, stage) => {
           if (ac.signal.aborted) return;
           setState((prev) => ({
@@ -104,16 +191,15 @@ export function useSoraWatermarkRemoval() {
             stageMessage: stage ?? prev.stageMessage,
           }));
         },
-        { quality, signal: ac.signal }
+        { quality, fillMode, signal: ac.signal }
       );
       if (ac.signal.aborted) return;
-      const url = URL.createObjectURL(blob);
       setState((prev) => ({
         ...prev,
         isRemoving: false,
         progress: 100,
         stageMessage: 'Done',
-        processedVideoUrl: url,
+        processedVideoUrl: URL.createObjectURL(blob),
         processedMimeType: mimeType,
       }));
     } catch (err: any) {
@@ -125,38 +211,48 @@ export function useSoraWatermarkRemoval() {
         error: err?.message || 'Watermark removal failed.',
       }));
     }
-  }, [state.detection]);
+  }, [timeline, state.detection]);
 
   const cancelDetection = useCallback(() => {
     detectAbortRef.current?.abort();
     setState((prev) => ({
-      ...prev,
-      isDetecting: false,
-      progress: 0,
-      stageMessage: '',
-      error: 'Detection cancelled.',
+      ...prev, isDetecting: false, progress: 0, stageMessage: '', error: 'Detection cancelled.',
     }));
   }, []);
 
   const cancelRemoval = useCallback(() => {
     removeAbortRef.current?.abort();
     setState((prev) => ({
-      ...prev,
-      isRemoving: false,
-      progress: 0,
-      stageMessage: '',
-      error: 'Removal cancelled.',
+      ...prev, isRemoving: false, progress: 0, stageMessage: '', error: 'Removal cancelled.',
     }));
   }, []);
 
   const reset = useCallback(() => {
     detectAbortRef.current?.abort();
     removeAbortRef.current?.abort();
+    previewAbortRef.current?.abort();
+    setPreview(null);
+    setIsPreviewing(false);
     setState((prev) => {
       if (prev.processedVideoUrl) URL.revokeObjectURL(prev.processedVideoUrl);
       return { ...INITIAL_STATE };
     });
   }, []);
 
-  return { state, detect, remove, cancelDetection, cancelRemoval, reset };
+  return {
+    state,
+    timeline,
+    preview,
+    isPreviewing,
+    detect,
+    remove,
+    addCorrection,
+    removeCorrection,
+    clearCorrections,
+    previewFill,
+    clearPreview,
+    cancelDetection,
+    cancelRemoval,
+    reset,
+  };
 }
