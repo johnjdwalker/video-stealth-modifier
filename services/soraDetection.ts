@@ -248,7 +248,7 @@ export function findCandidates(imageData: ImageData, W: number, H: number): Dete
       // band rather than a single value: too sparse is noise, too solid is a
       // filled shape rather than a logo.
       const densityFit =
-        density < DENSITY_IDEAL_MIN ? Math.max(0, 1 - (DENSITY_IDEAL_MIN - density) / 0.20) :
+        density < DENSITY_IDEAL_MIN ? Math.max(0, 1 - (DENSITY_IDEAL_MIN - density) / DENSITY_IDEAL_MIN) :
         density > DENSITY_IDEAL_MAX ? Math.max(0, 1 - (density - DENSITY_IDEAL_MAX) / 0.30) :
         1;
       // Sora's icon+wordmark sits around 3-4:1.

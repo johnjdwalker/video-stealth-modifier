@@ -50,14 +50,20 @@ const VideoStage: React.FC<VideoStageProps> = ({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
   const lastReportedTime = useRef(0);
+  const lastDrawnTime = useRef(-1);
   const [aspect, setAspect] = useState<number | null>(null);
 
   useEffect(() => {
+    // Capture canvas and 2D context once per effect lifetime.
+    // getContext returns the same object every call; obtaining it inside tick
+    // (60fps) is unnecessary work.
+    const cvs = canvasRef.current;
+    const ctx = cvs ? cvs.getContext('2d') : null;
+
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
       const v = video.current;
       const c = containerRef.current;
-      const cvs = canvasRef.current;
       if (!v || !c) return;
 
       if (onTimeUpdate && Math.abs(v.currentTime - lastReportedTime.current) > 0.1) {
@@ -65,9 +71,12 @@ const VideoStage: React.FC<VideoStageProps> = ({
         onTimeUpdate(v.currentTime);
       }
 
-      if (!cvs) return;
-      const ctx = cvs.getContext('2d');
-      if (!ctx) return;
+      if (!cvs || !ctx) return;
+
+      // Skip redundant canvas work when the video is paused and we already
+      // drew for this exact time position. The overlay is static when paused.
+      if (v.paused && lastDrawnTime.current === v.currentTime) return;
+      lastDrawnTime.current = v.currentTime;
 
       const containerW = c.clientWidth;
       const containerH = c.clientHeight;
