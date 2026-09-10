@@ -267,7 +267,7 @@ const SoraWatermarkRemover: React.FC = () => {
   const sourceVideoRef = useRef<HTMLVideoElement>(null);
 
   const {
-    state, timeline, preview, isPreviewing,
+    state, timeline, preview, isPreviewing, liveFrameUrl,
     detect, remove, addCorrection, removeCorrection, clearCorrections,
     previewFill, clearPreview, cancelDetection, cancelRemoval, reset,
   } = useSoraWatermarkRemoval();
@@ -397,12 +397,44 @@ const SoraWatermarkRemover: React.FC = () => {
             </div>
             <div>
               <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">
-                {state.processedVideoUrl ? 'Watermark removed' : 'Result'}
+                {state.processedVideoUrl
+                  ? 'Watermark removed'
+                  : liveFrameUrl
+                    ? (state.isRemoving ? 'Removing…' : 'Fill preview')
+                    : 'Result'}
               </h4>
-              <VideoStage
-                src={state.processedVideoUrl}
-                placeholder="Run removal to see the result here"
-              />
+              {state.processedVideoUrl ? (
+                <VideoStage
+                  src={state.processedVideoUrl}
+                  placeholder="Run removal to see the result here"
+                />
+              ) : liveFrameUrl ? (
+                <div
+                  className="relative w-full bg-black rounded-lg overflow-hidden shadow-xl"
+                  style={{
+                    aspectRatio: detection
+                      ? `${detection.videoWidth} / ${detection.videoHeight}`
+                      : '16 / 9',
+                    maxHeight: '58vh',
+                  }}
+                >
+                  <img
+                    src={liveFrameUrl}
+                    alt={state.isRemoving ? 'Processing preview' : 'Fill preview'}
+                    className="w-full h-full object-contain"
+                  />
+                  {state.isRemoving && (
+                    <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-xs text-white bg-black/70 rounded px-2 py-1 whitespace-nowrap pointer-events-none">
+                      Live preview — updating every ~1.5s
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <VideoStage
+                  src={null}
+                  placeholder="Run removal to see the result here"
+                />
+              )}
             </div>
           </div>
 

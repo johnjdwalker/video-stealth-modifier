@@ -32,6 +32,7 @@ export function useSoraWatermarkRemoval() {
   const [state, setState] = useState<SoraRemovalState>(INITIAL_STATE);
   const [preview, setPreview] = useState<FillPreview | null>(null);
   const [isPreviewing, setIsPreviewing] = useState(false);
+  const [liveFrameUrl, setLiveFrameUrl] = useState<string | null>(null);
 
   const detectAbortRef = useRef<AbortController | null>(null);
   const removeAbortRef = useRef<AbortController | null>(null);
@@ -139,7 +140,10 @@ export function useSoraWatermarkRemoval() {
       const result = await renderFillPreview(
         file, time, timeline, state.detection?.padding ?? 10, fillMode, { signal: ac.signal }
       );
-      if (!ac.signal.aborted) setPreview(result);
+      if (!ac.signal.aborted) {
+        setPreview(result);
+        if (result?.fullFrameUrl) setLiveFrameUrl(result.fullFrameUrl);
+      }
     } catch (err: any) {
       if (!ac.signal.aborted) {
         setState((prev) => ({ ...prev, error: err?.message || 'Could not render preview.' }));
@@ -191,7 +195,10 @@ export function useSoraWatermarkRemoval() {
             stageMessage: stage ?? prev.stageMessage,
           }));
         },
-        { quality, fillMode, signal: ac.signal }
+        {
+          quality, fillMode, signal: ac.signal,
+          onLiveFrame: (dataUrl) => { if (!ac.signal.aborted) setLiveFrameUrl(dataUrl); },
+        }
       );
       if (ac.signal.aborted) return;
       setState((prev) => ({
@@ -233,6 +240,7 @@ export function useSoraWatermarkRemoval() {
     previewAbortRef.current?.abort();
     setPreview(null);
     setIsPreviewing(false);
+    setLiveFrameUrl(null);
     setState((prev) => {
       if (prev.processedVideoUrl) URL.revokeObjectURL(prev.processedVideoUrl);
       return { ...INITIAL_STATE };
@@ -244,6 +252,7 @@ export function useSoraWatermarkRemoval() {
     timeline,
     preview,
     isPreviewing,
+    liveFrameUrl,
     detect,
     remove,
     addCorrection,

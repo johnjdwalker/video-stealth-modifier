@@ -368,6 +368,7 @@ export function snapBoxToClick(
 export interface FillPreview {
   beforeUrl: string;
   afterUrl: string;
+  fullFrameUrl: string;
   box: WatermarkCoords;
 }
 
@@ -424,13 +425,29 @@ export async function renderFillPreview(
     const scratch = createScratch();
     applyFill(ctx, scratch, references, time, box, W, H, fillMode);
     const afterUrl = cropToDataUrl(canvas, cropX, cropY, cropW, cropH);
+    const fullFrameUrl = frameToPreviewDataUrl(canvas);
 
-    return { beforeUrl, afterUrl, box };
+    return { beforeUrl, afterUrl, fullFrameUrl, box };
   } finally {
     video.removeAttribute('src');
     video.load();
     URL.revokeObjectURL(url);
   }
+}
+
+/** Downscales the full canvas to a compact JPEG data URL for live preview. */
+function frameToPreviewDataUrl(canvas: HTMLCanvasElement): string {
+  const maxW = 960;
+  const scale = Math.min(1, maxW / canvas.width);
+  const w = Math.round(canvas.width * scale);
+  const h = Math.round(canvas.height * scale);
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext('2d');
+  if (!octx) return '';
+  octx.drawImage(canvas, 0, 0, w, h);
+  return out.toDataURL('image/jpeg', 0.82);
 }
 
 function cropToDataUrl(
@@ -456,6 +473,8 @@ interface SoraRemovalOptions {
   quality?: SoraRemovalQuality;
   fillMode?: SoraFillMode;
   signal?: AbortSignal;
+  /** Called with a JPEG data URL roughly once per second during re-encode. */
+  onLiveFrame?: (dataUrl: string) => void;
 }
 
 export async function removeSoraWatermark(
@@ -465,7 +484,7 @@ export async function removeSoraWatermark(
   onProgress?: (progress: number, stage?: string) => void,
   options: SoraRemovalOptions = {}
 ): Promise<{ blob: Blob; mimeType: string }> {
-  const { quality = 'balanced', fillMode = 'auto', signal } = options;
+  const { quality = 'balanced', fillMode = 'auto', signal, onLiveFrame } = options;
   if (dwells.length === 0) throw new Error('No watermark region to remove.');
 
   const url = URL.createObjectURL(videoFile);
@@ -569,11 +588,16 @@ export async function removeSoraWatermark(
     });
 
     const scratch = createScratch();
+    let lastLiveFrameAt = -Infinity;
 
     const renderAt = (t: number) => {
       ctx.drawImage(video, 0, 0, W, H);
       const box = boxAtTime(dwells, t, padding, W, H);
       if (box) applyFill(ctx, scratch, references, t, box, W, H, fillMode);
+      if (onLiveFrame && t - lastLiveFrameAt >= 1.5) {
+        lastLiveFrameAt = t;
+        onLiveFrame(frameToPreviewDataUrl(canvas));
+      }
       if (duration > 0) {
         const base = fillMode === 'inpaint' ? 0 : 25;
         const pct = base + (t / duration) * (100 - base);
