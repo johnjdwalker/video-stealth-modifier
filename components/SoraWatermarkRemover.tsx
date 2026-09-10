@@ -14,7 +14,7 @@ const QUALITY_OPTIONS: Array<{ value: SoraRemovalQuality; label: string; descrip
 ];
 
 const FILL_OPTIONS: Array<{ value: SoraFillMode; label: string; description: string }> = [
-  { value: 'auto',     label: 'Auto',              description: 'Borrow real pixels when a clean donor frame exists, otherwise inpaint.' },
+  { value: 'auto',     label: 'Auto',              description: 'Borrow real pixels only where the background actually matches, otherwise inpaint. Best default.' },
   { value: 'temporal', label: 'Borrow from frame', description: 'Take pixels from a moment when the watermark was elsewhere. Sharpest when the background is still.' },
   { value: 'inpaint',  label: 'Inpaint edges',     description: 'Rebuild from the surrounding pixels. Never ghosts, but softer over detail.' },
 ];
@@ -26,23 +26,45 @@ function formatTime(seconds: number): string {
   return `${mins}:${secs.toFixed(1).padStart(4, '0')}`;
 }
 
+/** A drag that has not been committed yet, in video-pixel coordinates. */
+interface DragRect { x0: number; y0: number; x1: number; y1: number }
+
+/** Pointer travel (in video pixels) below which a gesture counts as a click. */
+const DRAG_THRESHOLD = 6;
+
+function rectFromDrag(d: DragRect): WatermarkCoords {
+  return {
+    x: Math.round(Math.min(d.x0, d.x1)),
+    y: Math.round(Math.min(d.y0, d.y1)),
+    width: Math.round(Math.abs(d.x1 - d.x0)),
+    height: Math.round(Math.abs(d.y1 - d.y0)),
+  };
+}
+
 interface VideoStageProps {
   src: string | null;
   dwells?: SoraDwell[];
   padding?: number;
   showOverlay?: boolean;
   onPickPoint?: (videoX: number, videoY: number, time: number, video: HTMLVideoElement) => void;
+  onPickRegion?: (box: WatermarkCoords, time: number, video: HTMLVideoElement) => void;
   onTimeUpdate?: (time: number) => void;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
   placeholder?: string;
 }
 
 const VideoStage: React.FC<VideoStageProps> = ({
-  src, dwells, padding = 10, showOverlay, onPickPoint, onTimeUpdate, videoRef, placeholder,
+  src, dwells, padding = 10, showOverlay, onPickPoint, onPickRegion, onTimeUpdate, videoRef, placeholder,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const localRef = useRef<HTMLVideoElement>(null);
   const video = videoRef ?? localRef;
+  // Live drag rectangle. Held in a ref so the rAF loop can read it without the
+  // effect resubscribing on every pointer move.
+  const dragRef = useRef<DragRect | null>(null);
+  // Forces one more overlay repaint even when the video is paused on the same
+  // frame — otherwise the paused-frame guard would freeze the drag rectangle.
+  const overlayDirty = useRef(false);
   // Canvas overlay — avoids getBoundingClientRect on the video element entirely.
   // We compute object-contain scale from clientWidth/clientHeight and draw in
   // video-pixel coordinates with a matching transform. This is immune to the
@@ -74,8 +96,10 @@ const VideoStage: React.FC<VideoStageProps> = ({
       if (!cvs || !ctx) return;
 
       // Skip redundant canvas work when the video is paused and we already
-      // drew for this exact time position. The overlay is static when paused.
-      if (v.paused && lastDrawnTime.current === v.currentTime) return;
+      // drew for this exact time position. The overlay is static when paused,
+      // unless a drag is in flight and the rectangle needs to follow the cursor.
+      if (v.paused && lastDrawnTime.current === v.currentTime && !overlayDirty.current) return;
+      overlayDirty.current = false;
       lastDrawnTime.current = v.currentTime;
 
       const containerW = c.clientWidth;
@@ -89,10 +113,7 @@ const VideoStage: React.FC<VideoStageProps> = ({
       }
       ctx.clearRect(0, 0, W, H);
 
-      if (!showOverlay || !dwells || dwells.length === 0 || !v.videoWidth || !v.videoHeight) return;
-
-      const box = boxAtTime(dwells, v.currentTime, padding, v.videoWidth, v.videoHeight);
-      if (!box) return;
+      if (!v.videoWidth || !v.videoHeight) return;
 
       // Replicate object-contain: scale to fill whichever axis is tighter.
       const vw = v.videoWidth;
@@ -103,45 +124,98 @@ const VideoStage: React.FC<VideoStageProps> = ({
 
       ctx.save();
       ctx.setTransform(scale, 0, 0, scale, ox, oy);
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.16)';
-      ctx.fillRect(box.x, box.y, box.width, box.height);
-      ctx.strokeStyle = '#f59e0b';
-      ctx.lineWidth = 2 / scale;
-      ctx.shadowColor = 'rgba(0,0,0,0.55)';
-      ctx.shadowBlur = 3 / scale;
-      ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+      const box = showOverlay && dwells && dwells.length > 0
+        ? boxAtTime(dwells, v.currentTime, padding, vw, vh)
+        : null;
+      if (box) {
+        ctx.fillStyle = 'rgba(245, 158, 11, 0.16)';
+        ctx.fillRect(box.x, box.y, box.width, box.height);
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = 2 / scale;
+        ctx.shadowColor = 'rgba(0,0,0,0.55)';
+        ctx.shadowBlur = 3 / scale;
+        ctx.strokeRect(box.x, box.y, box.width, box.height);
+      }
+
+      const drag = dragRef.current;
+      if (drag) {
+        const r = rectFromDrag(drag);
+        ctx.fillStyle = 'rgba(16, 185, 129, 0.18)';
+        ctx.fillRect(r.x, r.y, r.width, r.height);
+        ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 2 / scale;
+        ctx.setLineDash([6 / scale, 4 / scale]);
+        ctx.shadowColor = 'rgba(0,0,0,0.55)';
+        ctx.shadowBlur = 3 / scale;
+        ctx.strokeRect(r.x, r.y, r.width, r.height);
+        ctx.setLineDash([]);
+      }
       ctx.restore();
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
   }, [showOverlay, dwells, padding, onTimeUpdate, video]);
 
-  // Click handler: converts click to video-pixel coordinates using the same
-  // object-contain math as the canvas overlay.
-  const handleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    if (!onPickPoint) return;
+  // Converts a pointer position to video-pixel coordinates using the same
+  // object-contain math as the canvas overlay. Null when outside the picture.
+  const toVideoPoint = useCallback((clientX: number, clientY: number) => {
     const v = video.current;
     const c = containerRef.current;
-    if (!v || !c || !v.videoWidth || !v.videoHeight) return;
+    if (!v || !c || !v.videoWidth || !v.videoHeight) return null;
 
-    const containerW = c.clientWidth;
-    const containerH = c.clientHeight;
     const vw = v.videoWidth;
     const vh = v.videoHeight;
-    const scale = Math.min(containerW / vw, containerH / vh);
-    const ox = (containerW - vw * scale) / 2;
-    const oy = (containerH - vh * scale) / 2;
+    const scale = Math.min(c.clientWidth / vw, c.clientHeight / vh);
+    const ox = (c.clientWidth - vw * scale) / 2;
+    const oy = (c.clientHeight - vh * scale) / 2;
 
     const cRect = c.getBoundingClientRect();
-    const cx = e.clientX - cRect.left;
-    const cy = e.clientY - cRect.top;
+    const x = (clientX - cRect.left - ox) / scale;
+    const y = (clientY - cRect.top - oy) / scale;
+    if (x < 0 || y < 0 || x > vw || y > vh) return null;
+    return { x, y, video: v };
+  }, [video]);
 
-    const x = (cx - ox) / scale;
-    const y = (cy - oy) / scale;
-    if (x < 0 || y < 0 || x > vw || y > vh) return;
+  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (!onPickPoint && !onPickRegion) return;
+    const pt = toVideoPoint(e.clientX, e.clientY);
+    if (!pt) return;
+    // Pause so the frame under the cursor is the frame being marked up.
+    pt.video.pause();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragRef.current = { x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y };
+    overlayDirty.current = true;
+  }, [onPickPoint, onPickRegion, toVideoPoint]);
 
-    onPickPoint(x, y, v.currentTime, v);
-  }, [onPickPoint, video]);
+  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    const pt = toVideoPoint(e.clientX, e.clientY);
+    if (!pt) return;
+    dragRef.current = { ...dragRef.current, x1: pt.x, y1: pt.y };
+    overlayDirty.current = true;
+  }, [toVideoPoint]);
+
+  const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    overlayDirty.current = true;
+    if (!drag) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    const v = video.current;
+    if (!v) return;
+
+    const box = rectFromDrag(drag);
+    // A deliberate drag defines the region outright; a tap falls back to
+    // snapping onto whatever mark sits under the cursor.
+    if (box.width >= DRAG_THRESHOLD && box.height >= DRAG_THRESHOLD) {
+      onPickRegion?.(box, v.currentTime, v);
+    } else {
+      onPickPoint?.(drag.x0, drag.y0, v.currentTime, v);
+    }
+  }, [onPickPoint, onPickRegion, video]);
 
   if (!src) {
     return (
@@ -152,10 +226,20 @@ const VideoStage: React.FC<VideoStageProps> = ({
   }
 
   return (
+    // Geometry here is functional, not decorative: the overlay and the pointer
+    // maths both assume the container establishes a positioning context and that
+    // the video is letterboxed with object-contain. Those few properties are set
+    // inline rather than through Tailwind so a blocked or slow CDN degrades the
+    // styling without silently breaking watermark placement.
     <div
       ref={containerRef}
-      className="relative w-full bg-black rounded-lg overflow-hidden shadow-xl mx-auto"
-      style={{ aspectRatio: aspect ? `${aspect}` : '16 / 9', maxHeight: '58vh' }}
+      className="w-full bg-black rounded-lg overflow-hidden shadow-xl mx-auto"
+      style={{
+        position: 'relative',
+        width: '100%',
+        aspectRatio: aspect ? `${aspect}` : '16 / 9',
+        maxHeight: '58vh',
+      }}
     >
       <video
         ref={video}
@@ -169,7 +253,7 @@ const VideoStage: React.FC<VideoStageProps> = ({
           const el = e.currentTarget;
           if (el.videoWidth && el.videoHeight) setAspect(el.videoWidth / el.videoHeight);
         }}
-        className="w-full h-full object-contain"
+        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
       />
       {/* Canvas overlay: drawn in video-pixel coordinates, immune to letterbox bugs */}
       <canvas
@@ -184,12 +268,23 @@ const VideoStage: React.FC<VideoStageProps> = ({
           zIndex: 10,
         }}
       />
-      {onPickPoint && (
+      {(onPickPoint || onPickRegion) && (
         <div
-          onClick={handleClick}
-          className="absolute inset-x-0 top-0 cursor-crosshair"
-          style={{ bottom: '3.5rem', zIndex: 15 }}
-          aria-label="Click the watermark to set its position"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: '3.5rem', // clear of the video's own controls
+            zIndex: 15,
+            cursor: 'crosshair',
+            touchAction: 'none',
+          }}
+          aria-label="Drag a box around the watermark, or click it to snap"
         />
       )}
     </div>
@@ -331,8 +426,18 @@ const SoraWatermarkRemover: React.FC = () => {
     const box: WatermarkCoords = snapBoxToClick(video, x, y, state.detection?.logoSize ?? null);
     addCorrection(time, box);
     clearPreview();
-    setLastAction(`Watermark position set at ${formatTime(time)} — amber box should now sit on the mark.`);
+    setLastAction(
+      `Snapped to ${box.width}×${box.height}px at ${formatTime(time)}. ` +
+      'If that box is wrong, drag one around the mark instead.'
+    );
   }, [addCorrection, clearPreview, state.detection]);
+
+  const handlePickRegion = useCallback((box: WatermarkCoords, time: number, video: HTMLVideoElement) => {
+    video.pause();
+    addCorrection(time, box);
+    clearPreview();
+    setLastAction(`Region set at ${formatTime(time)} — ${box.width}×${box.height}px at (${box.x}, ${box.y}).`);
+  }, [addCorrection, clearPreview]);
 
   const seekTo = useCallback((time: number) => {
     const v = sourceVideoRef.current;
@@ -369,7 +474,7 @@ const SoraWatermarkRemover: React.FC = () => {
             <p className="font-semibold text-gray-100 mb-2">How this works</p>
             <ol className="list-decimal ml-5 space-y-1 text-gray-400">
               <li><span className="text-gray-200">Detect</span> — samples frames and tracks where the watermark sits over time.</li>
-              <li><span className="text-gray-200">Correct</span> — if the amber box is off, click directly on the watermark to fix it.</li>
+              <li><span className="text-gray-200">Correct</span> — if the amber box is off or missing, drag a box around the watermark yourself.</li>
               <li><span className="text-gray-200">Preview the fill</span> — compare fill methods on a single frame before committing.</li>
               <li><span className="text-gray-200">Remove</span> — rebuilds the clip at high bitrate, MP4 where the browser allows it.</li>
             </ol>
@@ -383,7 +488,7 @@ const SoraWatermarkRemover: React.FC = () => {
               <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">
                 Original
                 {hasTimeline && <span className="text-sm font-normal text-amber-400"> · amber box = watermark region</span>}
-                {correcting && <span className="text-sm font-normal text-emerald-400"> · click the watermark</span>}
+                {correcting && <span className="text-sm font-normal text-emerald-400"> · drag a box around the watermark</span>}
               </h4>
               <VideoStage
                 src={previewUrl}
@@ -391,6 +496,7 @@ const SoraWatermarkRemover: React.FC = () => {
                 padding={detection?.padding ?? 10}
                 showOverlay={hasTimeline}
                 onPickPoint={correcting ? handlePickPoint : undefined}
+                onPickRegion={correcting ? handlePickRegion : undefined}
                 onTimeUpdate={setCurrentTime}
                 videoRef={sourceVideoRef}
               />
@@ -410,8 +516,10 @@ const SoraWatermarkRemover: React.FC = () => {
                 />
               ) : liveFrameUrl ? (
                 <div
-                  className="relative w-full bg-black rounded-lg overflow-hidden shadow-xl"
+                  className="w-full bg-black rounded-lg overflow-hidden shadow-xl"
                   style={{
+                    position: 'relative',
+                    width: '100%',
                     aspectRatio: detection
                       ? `${detection.videoWidth} / ${detection.videoHeight}`
                       : '16 / 9',
@@ -421,7 +529,7 @@ const SoraWatermarkRemover: React.FC = () => {
                   <img
                     src={liveFrameUrl}
                     alt={state.isRemoving ? 'Processing preview' : 'Fill preview'}
-                    className="w-full h-full object-contain"
+                    style={{ width: '100%', height: '100%', objectFit: 'contain' }}
                   />
                   {state.isRemoving && (
                     <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-xs text-white bg-black/70 rounded px-2 py-1 whitespace-nowrap pointer-events-none">
@@ -514,8 +622,8 @@ const SoraWatermarkRemover: React.FC = () => {
               <div className="bg-amber-900/40 border border-amber-700 rounded-lg p-4 text-sm">
                 <p className="text-amber-300 font-semibold mb-1">Auto-detect found nothing</p>
                 <p className="text-amber-200/80">
-                  Click-to-fix is now on — click directly on the watermark in the video above.
-                  The amber box will appear and you can then remove it.
+                  Click-to-fix is now on — drag a box around the watermark in the video above.
+                  The region appears immediately and you can then remove it.
                 </p>
               </div>
             )}
@@ -536,8 +644,8 @@ const SoraWatermarkRemover: React.FC = () => {
               </div>
               <p className="text-sm text-gray-400">
                 {correcting
-                  ? 'Click directly on the watermark in the video. The video pauses so you can verify the amber box is correct.'
-                  : 'Turn this on if the amber box is off-target, then click the watermark in the video.'}
+                  ? 'Drag a box around the watermark in the video — that region is used exactly as drawn. A single click instead snaps to the mark under the cursor. Either way the video pauses so you can check the result.'
+                  : 'Turn this on if the amber box is off-target or missing, then drag a box around the watermark in the video.'}
               </p>
               {lastAction && <p className="text-sm text-emerald-400 mt-2" role="status">{lastAction}</p>}
 

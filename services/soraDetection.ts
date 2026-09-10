@@ -41,22 +41,28 @@ const CLOSE_RADIUS_X_FRAC = 0.018;
 const CLOSE_RADIUS_Y_FRAC = 0.004;
 
 // Shape priors for the Sora mark, relative to the frame's *width*.
-const MIN_MARK_W_FRAC = 0.05;
+const MIN_MARK_W_FRAC = 0.035;
 const MAX_MARK_W_FRAC = 0.45;
 const MIN_MARK_H_FRAC = 0.012;
-const MAX_MARK_H_FRAC = 0.14;
-// Icon + wordmark is a wide, short shape.
-const MIN_ASPECT = 1.4;
+const MAX_MARK_H_FRAC = 0.18;
+// Sora renders in two forms: the icon alone (roughly square) and the icon plus
+// the "Sora" wordmark (wide and short). The bounds have to admit both, so they
+// span from square-ish to a long wordmark; `aspectFit` below rewards whichever
+// of the two shapes a candidate is closer to.
+const MIN_ASPECT = 0.65;
 const MAX_ASPECT = 8.0;
+const ICON_ASPECT = 1.0;
+const WORDMARK_ASPECT = 3.4;
 
 // Fraction of a candidate's box that should be watermark-like. Below the band
 // is noise; above it is a solid shape rather than an icon plus lettering.
 const DENSITY_IDEAL_MIN = 0.10;
 const DENSITY_IDEAL_MAX = 0.70;
 
-// The mark hugs an edge: its centre must fall in the outer band of the frame
-// on at least one axis.  0.45 is generous enough for marks that sit near (but
-// not at) a corner, including marks near a face in the upper portion of the frame.
+// Sora's mark drifts across the whole frame rather than sitting in a corner, so
+// proximity to an edge is a mild preference, not a requirement — a mark parked
+// over a subject's face in mid-frame is common and must still be found. Used
+// only to scale `edgeFit`, which carries a small share of the score.
 const EDGE_BAND_FRAC = 0.45;
 
 // Candidates kept per sampled frame, so clustering can recover when the best
@@ -232,12 +238,8 @@ export function findCandidates(imageData: ImageData, W: number, H: number): Dete
       const aspect = bw / bh;
       if (aspect < MIN_ASPECT || aspect > MAX_ASPECT) continue;
 
-      // Must hug an edge on at least one axis.
       const cxc = minX + bw / 2;
       const cyc = minY + bh / 2;
-      const nearX = cxc < W * EDGE_BAND_FRAC || cxc > W * (1 - EDGE_BAND_FRAC);
-      const nearY = cyc < H * EDGE_BAND_FRAC || cyc > H * (1 - EDGE_BAND_FRAC);
-      if (!nearX && !nearY) continue;
 
       const meanContrast = contrastSum / corePixels;
       // Fraction of the box that is genuinely watermark-like. A real mark is
@@ -251,17 +253,22 @@ export function findCandidates(imageData: ImageData, W: number, H: number): Dete
         density < DENSITY_IDEAL_MIN ? Math.max(0, 1 - (DENSITY_IDEAL_MIN - density) / DENSITY_IDEAL_MIN) :
         density > DENSITY_IDEAL_MAX ? Math.max(0, 1 - (density - DENSITY_IDEAL_MAX) / 0.30) :
         1;
-      // Sora's icon+wordmark sits around 3-4:1.
-      const aspectFit = 1 - Math.min(1, Math.abs(aspect - 3.4) / 3.4);
+      // Score against whichever Sora form the candidate resembles: the icon on
+      // its own (~1:1) or the icon plus wordmark (~3.4:1). Scoring against the
+      // wordmark alone would bury every icon-only mark.
+      const aspectFit = Math.max(
+        1 - Math.min(1, Math.abs(aspect - ICON_ASPECT) / 1.2),
+        1 - Math.min(1, Math.abs(aspect - WORDMARK_ASPECT) / WORDMARK_ASPECT)
+      );
       const distToEdge = Math.min(cxc, W - cxc, cyc, H - cyc);
       const edgeFit = 1 - Math.min(1, distToEdge / (Math.min(W, H) * EDGE_BAND_FRAC));
       const contrastFit = Math.min(1, meanContrast / 70);
 
       const score =
-        contrastFit * 0.40 +
+        contrastFit * 0.45 +
         densityFit  * 0.20 +
-        aspectFit   * 0.22 +
-        edgeFit     * 0.18;
+        aspectFit   * 0.25 +
+        edgeFit     * 0.10;
 
       candidates.push({
         bbox: { x: minX, y: minY, width: bw, height: bh },

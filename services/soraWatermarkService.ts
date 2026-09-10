@@ -33,6 +33,15 @@ const REFERENCE_FRAME_COUNTS: Record<SoraRemovalQuality, number> = {
 // Feathering width (source pixels) around the patched region.
 const FEATHER_PIXELS = 6;
 
+// Donor validation for temporal fill. A donor is only usable while the pixels
+// around the mark still match the live frame; past this mean per-channel
+// difference the scene has moved and borrowing would smear stale content in.
+// 18/255 tolerates compression noise and lighting drift but not real motion.
+const RING_MATCH_MAX_DIFF = 18;
+const RING_SAMPLE_STRIDE = 2;
+// How often the donor check runs, in seconds of media time.
+const DONOR_RECHECK_SECONDS = 0.25;
+
 // Padding around each detected box, to cover soft edges and antialiasing.
 const DEFAULT_PADDING = 10;
 
@@ -310,8 +319,11 @@ export function snapBoxToClick(
 ): WatermarkCoords {
   const W = video.videoWidth;
   const H = video.videoHeight;
-  const fallbackW = Math.max(24, fallbackSize?.width ?? Math.round(W * 0.20));
-  const fallbackH = Math.max(12, fallbackSize?.height ?? Math.round(W * 0.055));
+  // With no detected mark to size against, a compact square is the safer guess:
+  // it covers an icon-only mark, and a wrong square is easier for the user to
+  // correct by dragging than a wide bar that spans unrelated content.
+  const fallbackW = Math.max(24, fallbackSize?.width ?? Math.round(W * 0.09));
+  const fallbackH = Math.max(24, fallbackSize?.height ?? Math.round(W * 0.09));
   const fallback = clampBox({
     x: Math.round(clickX - fallbackW / 2),
     y: Math.round(clickY - fallbackH / 2),
@@ -490,7 +502,12 @@ export async function removeSoraWatermark(
   const url = URL.createObjectURL(videoFile);
   const video = document.createElement('video');
   video.preload = 'auto';
-  video.muted = true;
+  // Deliberately NOT muted: a muted element feeds silence into the Web Audio
+  // graph, so createMediaElementSource below would capture a silent track and
+  // every export would lose its audio. Nothing reaches the speakers anyway —
+  // creating the source node reroutes the element's audio into the graph, and
+  // the graph is only connected to the recording destination.
+  video.muted = false;
   video.playsInline = true;
   video.src = url;
 
@@ -550,7 +567,10 @@ export async function removeSoraWatermark(
       sourceNode.connect(dest);
       audioTrack = dest.stream.getAudioTracks()[0];
     } catch {
-      // No audio is fine — continue with a video-only output.
+      // No audio track, or the element is already tapped. Continue video-only,
+      // but re-mute: without the graph in front of it the element would now
+      // play out loud through the speakers during processing.
+      video.muted = true;
     }
 
     // When requestVideoFrameCallback is available, drive the canvas from
@@ -657,6 +677,7 @@ export async function removeSoraWatermark(
 interface Reference {
   time: number;
   canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
   box: WatermarkCoords | null;
 }
 
@@ -665,6 +686,10 @@ interface Scratch {
   maskCtx: CanvasRenderingContext2D | null;
   patch: HTMLCanvasElement;
   patchCtx: CanvasRenderingContext2D | null;
+  // Whether the current donor still matches the live frame. Re-checked at most
+  // every DONOR_RECHECK_SECONDS so the pixel readback stays off the hot path.
+  donorCheckedAt: number;
+  donorUsable: boolean;
 }
 
 function createScratch(): Scratch {
@@ -672,10 +697,107 @@ function createScratch(): Scratch {
   const patch = document.createElement('canvas');
   return {
     mask,
-    maskCtx: mask.getContext('2d'),
+    maskCtx: mask.getContext('2d', { willReadFrequently: true }),
     patch,
-    patchCtx: patch.getContext('2d'),
+    patchCtx: patch.getContext('2d', { willReadFrequently: true }),
+    donorCheckedAt: -Infinity,
+    donorUsable: false,
   };
+}
+
+/** Resizes a scratch canvas, or clears it when it is already the right size. */
+function sizeScratch(
+  cvs: HTMLCanvasElement, ctx: CanvasRenderingContext2D, w: number, h: number
+): void {
+  if (cvs.width !== w || cvs.height !== h) {
+    cvs.width = w;
+    cvs.height = h;
+  } else {
+    ctx.clearRect(0, 0, w, h);
+  }
+}
+
+/**
+ * Paints a rectangular feather mask of `w`x`h`.
+ *
+ * `core` makes the middle opaque and fades the outermost `feather` pixels to
+ * nothing; `rim` is the exact inverse. The falloff runs per edge rather than
+ * radially: a circle inscribed in a rectangle leaves the corners outside its
+ * radius, which let the original watermark bleed back through the corners of
+ * every patch.
+ */
+function paintFeatherMask(
+  ctx: CanvasRenderingContext2D, w: number, h: number, feather: number, kind: 'core' | 'rim'
+): void {
+  const edge = (x0: number, y0: number, x1: number, y1: number) => {
+    const grad = ctx.createLinearGradient(x0, y0, x1, y1);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    return grad;
+  };
+
+  if (kind === 'core') {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalCompositeOperation = 'destination-out';
+  } else {
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  ctx.fillStyle = edge(0, 0, feather, 0);         ctx.fillRect(0, 0, feather, h);
+  ctx.fillStyle = edge(w, 0, w - feather, 0);     ctx.fillRect(w - feather, 0, feather, h);
+  ctx.fillStyle = edge(0, 0, 0, feather);         ctx.fillRect(0, 0, w, feather);
+  ctx.fillStyle = edge(0, h, 0, h - feather);     ctx.fillRect(0, h - feather, w, feather);
+
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/**
+ * Mean per-channel difference between the live frame and a donor frame over the
+ * ring of pixels surrounding `box` — the mark itself is excluded, since the
+ * donor is by definition clean there and the live frame is not.
+ *
+ * Temporal fill copies donor pixels from the same coordinates at a different
+ * time, so it is only valid while the background under the mark has not moved.
+ * A large ring difference means the scene shifted and those coordinates now hold
+ * something else entirely; borrowing would stamp a stale patch over live content.
+ */
+function donorRingMismatch(
+  ctx: CanvasRenderingContext2D,
+  ref: Reference,
+  box: WatermarkCoords,
+  W: number,
+  H: number
+): number {
+  const margin = clamp(Math.round(Math.max(box.width, box.height) * 0.35), 6, 48);
+  const rx = clamp(box.x - margin, 0, Math.max(0, W - 1));
+  const ry = clamp(box.y - margin, 0, Math.max(0, H - 1));
+  const rw = clamp(box.width + margin * 2, 1, W - rx);
+  const rh = clamp(box.height + margin * 2, 1, H - ry);
+  if (rw < 4 || rh < 4) return 0;
+
+  const live = ctx.getImageData(rx, ry, rw, rh).data;
+  const donor = ref.ctx.getImageData(rx, ry, rw, rh).data;
+
+  // The mark's own box, in coordinates local to the sampled region.
+  const ix0 = box.x - rx, iy0 = box.y - ry;
+  const ix1 = ix0 + box.width, iy1 = iy0 + box.height;
+
+  let total = 0;
+  let samples = 0;
+  for (let y = 0; y < rh; y += RING_SAMPLE_STRIDE) {
+    const insideY = y >= iy0 && y < iy1;
+    for (let x = 0; x < rw; x += RING_SAMPLE_STRIDE) {
+      if (insideY && x >= ix0 && x < ix1) continue;
+      const p = (y * rw + x) * 4;
+      total += Math.abs(live[p] - donor[p]) +
+               Math.abs(live[p + 1] - donor[p + 1]) +
+               Math.abs(live[p + 2] - donor[p + 2]);
+      samples += 3;
+    }
+  }
+  return samples > 0 ? total / samples : 0;
 }
 
 /**
@@ -704,10 +826,10 @@ async function extractReferences(
     const refCanvas = document.createElement('canvas');
     refCanvas.width = W;
     refCanvas.height = H;
-    const refCtx = refCanvas.getContext('2d', { alpha: false });
+    const refCtx = refCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
     if (!refCtx) continue;
     refCtx.drawImage(video, 0, 0, W, H);
-    references.push({ time: t, canvas: refCanvas, box: boxAtTime(dwells, t, padding, W, H) });
+    references.push({ time: t, canvas: refCanvas, ctx: refCtx, box: boxAtTime(dwells, t, padding, W, H) });
     onProgress?.((i + 1) / count);
   }
   return references;
@@ -732,6 +854,42 @@ function pickCleanReference(
   return best;
 }
 
+/**
+ * Inpaints the region and feathers its rim back into the untouched pixels, so
+ * the reconstruction fades out instead of ending on a visible rectangle edge.
+ */
+function inpaintFeathered(
+  ctx: CanvasRenderingContext2D,
+  scratch: Scratch,
+  box: WatermarkCoords,
+  W: number,
+  H: number
+): void {
+  const { patch, patchCtx, mask, maskCtx } = scratch;
+  const feather = Math.min(FEATHER_PIXELS, Math.floor(Math.min(box.width, box.height) / 2));
+  if (feather <= 0 || !patchCtx || !maskCtx) {
+    inpaintCanvasRegion(ctx, box.x, box.y, box.width, box.height, W, H);
+    return;
+  }
+
+  // Keep the untouched pixels before the fill overwrites them.
+  sizeScratch(patch, patchCtx, box.width, box.height);
+  patchCtx.globalCompositeOperation = 'source-over';
+  patchCtx.drawImage(ctx.canvas, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
+
+  inpaintCanvasRegion(ctx, box.x, box.y, box.width, box.height, W, H);
+
+  // Mask is clear in the core and opaque at the rim, so drawing the saved
+  // originals back restores the outer edge and leaves the fill in the middle.
+  sizeScratch(mask, maskCtx, box.width, box.height);
+  paintFeatherMask(maskCtx, box.width, box.height, feather, 'rim');
+
+  patchCtx.globalCompositeOperation = 'destination-in';
+  patchCtx.drawImage(mask, 0, 0);
+  patchCtx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(patch, box.x, box.y);
+}
+
 function applyFill(
   ctx: CanvasRenderingContext2D,
   scratch: Scratch,
@@ -745,7 +903,7 @@ function applyFill(
   if (box.width <= 0 || box.height <= 0) return;
 
   if (fillMode === 'inpaint') {
-    inpaintCanvasRegion(ctx, box.x, box.y, box.width, box.height, W, H);
+    inpaintFeathered(ctx, scratch, box, W, H);
     return;
   }
 
@@ -753,8 +911,21 @@ function applyFill(
   if (!ref) {
     // `temporal` promised real pixels and there are none clean enough; falling
     // back beats stamping the watermark back over itself from a bad donor.
-    inpaintCanvasRegion(ctx, box.x, box.y, box.width, box.height, W, H);
+    inpaintFeathered(ctx, scratch, box, W, H);
     return;
+  }
+
+  // `auto` only borrows while the donor still lines up with the live frame.
+  // `temporal` is an explicit request for real pixels, so it borrows regardless.
+  if (fillMode === 'auto') {
+    if (Math.abs(currentTime - scratch.donorCheckedAt) >= DONOR_RECHECK_SECONDS) {
+      scratch.donorCheckedAt = currentTime;
+      scratch.donorUsable = donorRingMismatch(ctx, ref, box, W, H) <= RING_MATCH_MAX_DIFF;
+    }
+    if (!scratch.donorUsable) {
+      inpaintFeathered(ctx, scratch, box, W, H);
+      return;
+    }
   }
 
   const { maskCtx, patchCtx, mask, patch } = scratch;
@@ -762,33 +933,15 @@ function applyFill(
 
   const feather = Math.min(FEATHER_PIXELS, Math.floor(Math.min(box.width, box.height) / 2));
 
-  if (mask.width !== box.width || mask.height !== box.height) {
-    mask.width = box.width;
-    mask.height = box.height;
-  } else {
-    maskCtx.clearRect(0, 0, box.width, box.height);
-  }
+  sizeScratch(mask, maskCtx, box.width, box.height);
   if (feather <= 0) {
     maskCtx.fillStyle = 'white';
     maskCtx.fillRect(0, 0, box.width, box.height);
   } else {
-    const grad = maskCtx.createRadialGradient(
-      box.width / 2, box.height / 2, 0,
-      box.width / 2, box.height / 2, Math.max(box.width, box.height) / 2
-    );
-    grad.addColorStop(0, 'rgba(255,255,255,1)');
-    grad.addColorStop(Math.max(0, 1 - feather / Math.max(box.width, box.height)), 'rgba(255,255,255,1)');
-    grad.addColorStop(1, 'rgba(255,255,255,0)');
-    maskCtx.fillStyle = grad;
-    maskCtx.fillRect(0, 0, box.width, box.height);
+    paintFeatherMask(maskCtx, box.width, box.height, feather, 'core');
   }
 
-  if (patch.width !== box.width || patch.height !== box.height) {
-    patch.width = box.width;
-    patch.height = box.height;
-  } else {
-    patchCtx.clearRect(0, 0, box.width, box.height);
-  }
+  sizeScratch(patch, patchCtx, box.width, box.height);
   patchCtx.globalCompositeOperation = 'source-over';
   patchCtx.drawImage(ref.canvas, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
   patchCtx.globalCompositeOperation = 'destination-in';

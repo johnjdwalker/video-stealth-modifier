@@ -107,5 +107,34 @@ console.log(`${twoDwells?'PASS':'FAIL'}  ${'dwell clustering finds 2 positions'.
 pass = twoDwells && pass;
 console.log(`       median mark size = ${logoSize ? logoSize.width+'x'+logoSize.height : 'null'}`);
 
+// 7. Icon-only mark (no wordmark). Sora often stamps just the glyph, which is
+// roughly square — the old aspect floor of 1.4 threw these out before scoring.
+function drawIcon(d, x, y) {
+  const s = 14;
+  put(d, x, y, s, s, 250, 250, 250);
+  // Punch a hole so it reads as a glyph rather than a solid slab.
+  put(d, x + 4, y + 4, 6, 6, 74, 68, 60);
+  return { x, y, width: s, height: s };
+}
+d = blank();
+const truth3 = drawIcon(d, 30, 400);
+c = findCandidates(img(d), W, H);
+const iconHit = c.length > 0 && Math.abs(c[0].bbox.x - truth3.x) <= 3 && Math.abs(c[0].bbox.y - truth3.y) <= 3;
+console.log(`${iconHit?'PASS':'FAIL'}  ${'icon-only mark (square) is found'.padEnd(46)} ` +
+  (c.length ? `[${c[0].bbox.x},${c[0].bbox.y} ${c[0].bbox.width}x${c[0].bbox.height} score=${c[0].score.toFixed(2)}]` : 'none'));
+pass = iconHit && pass;
+
+// 8. Mark parked in mid-frame, over a subject rather than near an edge. The old
+// detector required the centre to sit in an outer band and rejected this
+// outright, which is exactly the case the user hit (mark on a forehead).
+d = blank();
+put(d, 80, 180, 110, 150, 150, 120, 100);     // a face-ish mid-frame subject
+const truth4 = drawMark(d, 110, 234);          // dead centre on both axes
+c = findCandidates(img(d), W, H);
+const midHit = c.some(k => Math.abs(k.bbox.x - truth4.x) <= 4 && Math.abs(k.bbox.y - truth4.y) <= 4);
+console.log(`${midHit?'PASS':'FAIL'}  ${'mid-frame mark (over a subject) is found'.padEnd(46)} ` +
+  (c.length ? `[${c[0].bbox.x},${c[0].bbox.y} ${c[0].bbox.width}x${c[0].bbox.height}]` : 'none'));
+pass = midHit && pass;
+
 console.log(pass ? '\nALL PASS' : '\nSOME FAILED');
 process.exit(pass ? 0 : 1);
