@@ -42,23 +42,34 @@ const ASPECT_PRIOR_SOFT_MAX = 9.0;
 
 // Reference frame counts per quality level. More references = better fill, more memory.
 const REFERENCE_FRAME_COUNTS: Record<SoraRemovalQuality, number> = {
-  fast: 6,
-  balanced: 10,
-  high: 16,
+  fast: 8,
+  balanced: 14,
+  high: 22,
 };
 
 // Feathering radius (in pixels at full resolution) around the per-frame mask.
-const FEATHER_PIXELS = 4;
-// Dilate the bright-pixel mask slightly so soft AA edges are covered.
-const MASK_DILATE_PX = 2;
+const FEATHER_PIXELS = 8;
+// Dilate the bright-pixel mask so thin glyphs / soft AA edges are covered.
+const MASK_DILATE_PX = 5;
+// Extra morphological close radius after dilate (connects broken thin text strokes).
+const MASK_CLOSE_PX = 2;
 
 // Padding (in pixels at full resolution) added around each detected bbox to
-// catch soft edges, antialiasing and slight motion between sampled frames.
-const DEFAULT_PADDING = 12;
+// catch soft edges, antialiasing, thin text, and slight motion between samples.
+const DEFAULT_PADDING = 20;
+// Extra horizontal padding — Sora text strip is wider than the logo alone.
+const DEFAULT_PADDING_X_EXTRA = 8;
 
-// Residual verification: fraction of ROI bright pixels that may remain after removal.
-const RESIDUAL_FAIL_FRACTION = 0.045;
-const RESIDUAL_SAMPLE_COUNT = 8;
+// How many clean donor frames to blend for each patch (edge-aware multi-ref).
+const MULTI_REF_BLEND = 3;
+
+// Residual verification: tighter thresholds + denser trajectory sampling.
+// Average ROI bright fraction above this fails; any single sample above MAX fails.
+const RESIDUAL_FAIL_FRACTION = 0.018;
+const RESIDUAL_FAIL_FRACTION_MAX = 0.035;
+const RESIDUAL_SAMPLE_COUNT = 24;
+// Minimum connected bright cluster (px) inside ROI that matches logo+text prior → fail.
+const RESIDUAL_CLUSTER_MIN_PX = 28;
 
 // ----------------------------------------------------------------------------
 // Public API
@@ -405,8 +416,125 @@ export async function removeSoraWatermark(
 }
 
 /**
- * Sample frames from the cleaned output and measure remaining bright translucent
- * pixels inside the expected watermark trajectory ROI. Used for honest UI status.
+ * Build sample times denser along the known trajectory (plus uniform coverage)
+ * so residual checks don't miss the bouncing logo between sparse points.
+ */
+function residualSampleTimes(
+  trajectory: SoraWatermarkSample[],
+  duration: number,
+  count: number
+): number[] {
+  const times: number[] = [];
+  const seen = new Set<number>();
+  const push = (t: number) => {
+    const clamped = Math.min(duration - 0.001, Math.max(0, t));
+    const key = Math.round(clamped * 1000);
+    if (seen.has(key)) return;
+    seen.add(key);
+    times.push(clamped);
+  };
+
+  // Uniform coverage across the clip.
+  for (let i = 0; i < count; i++) {
+    push(duration * ((i + 0.5) / count));
+  }
+  // Extra samples at and between trajectory keypoints (where the logo was tracked).
+  for (let i = 0; i < trajectory.length; i++) {
+    push(trajectory[i].time);
+    if (i + 1 < trajectory.length) {
+      const a = trajectory[i].time;
+      const b = trajectory[i + 1].time;
+      push((a + b) / 2);
+      // Quarter points when the gap is large (fast bounce).
+      if (b - a > 0.35) {
+        push(a + (b - a) * 0.25);
+        push(a + (b - a) * 0.75);
+      }
+    }
+  }
+  times.sort((a, b) => a - b);
+  return times;
+}
+
+/**
+ * Largest connected bright/low-sat cluster inside ROI. Returns pixel count and
+ * bbox aspect — used to catch readable logo+text residuals that a raw fraction misses.
+ */
+function largestBrightClusterInRoi(
+  roi: ImageData
+): { pixels: number; aspect: number; density: number } | null {
+  const bw = roi.width;
+  const bh = roi.height;
+  const data = roi.data;
+  const mask = new Uint8Array(bw * bh);
+  for (let i = 0, p = 0; i < bw * bh; i++, p += 4) {
+    const r = data[p], g = data[p + 1], b = data[p + 2];
+    const maxC = Math.max(r, g, b);
+    const minC = Math.min(r, g, b);
+    const sat = maxC - minC;
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    // Slightly softer residual thresholds — catch partially cleaned translucent glyphs.
+    if (lum >= BRIGHT_THRESHOLD - 8 && sat <= LOW_SATURATION_THRESHOLD + 10) {
+      mask[i] = 1;
+    }
+  }
+
+  const visited = new Uint8Array(bw * bh);
+  const stack: number[] = [];
+  let bestPixels = 0;
+  let bestAspect = 0;
+  let bestDensity = 0;
+
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const start = y * bw + x;
+      if (!mask[start] || visited[start]) continue;
+      let minX = x, maxX = x, minY = y, maxY = y, count = 0;
+      stack.length = 0;
+      stack.push(start);
+      visited[start] = 1;
+      while (stack.length) {
+        const idx = stack.pop()!;
+        const cy = (idx / bw) | 0;
+        const cx = idx - cy * bw;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+        count++;
+        if (cx > 0)     { const n = idx - 1; if (mask[n] && !visited[n]) { visited[n] = 1; stack.push(n); } }
+        if (cx < bw - 1){ const n = idx + 1; if (mask[n] && !visited[n]) { visited[n] = 1; stack.push(n); } }
+        if (cy > 0)     { const n = idx - bw; if (mask[n] && !visited[n]) { visited[n] = 1; stack.push(n); } }
+        if (cy < bh - 1){ const n = idx + bw; if (mask[n] && !visited[n]) { visited[n] = 1; stack.push(n); } }
+      }
+      const boxW = maxX - minX + 1;
+      const boxH = maxY - minY + 1;
+      const aspect = boxW / Math.max(1, boxH);
+      const density = count / Math.max(1, boxW * boxH);
+      if (count > bestPixels) {
+        bestPixels = count;
+        bestAspect = aspect;
+        bestDensity = density;
+      }
+    }
+  }
+  if (bestPixels <= 0) return null;
+  return { pixels: bestPixels, aspect: bestAspect, density: bestDensity };
+}
+
+function clusterMatchesLogoTextPrior(cluster: { pixels: number; aspect: number; density: number }): boolean {
+  if (cluster.pixels < RESIDUAL_CLUSTER_MIN_PX) return false;
+  const aspectOk =
+    (cluster.aspect >= ASPECT_PRIOR_SOFT_MIN && cluster.aspect <= ASPECT_PRIOR_SOFT_MAX);
+  // Logo+text residuals are mid-density translucent strips (not solid white blobs).
+  const densityOk = cluster.density >= 0.08 && cluster.density <= 0.85;
+  return aspectOk && densityOk;
+}
+
+/**
+ * Sample frames from the cleaned output along the watermark trajectory and
+ * measure remaining bright translucent clusters inside the expected ROI.
+ * Fails (so UI shows Partial) if residual logo+text prior still matches.
  */
 export async function verifyResidualWatermark(
   cleanedBlob: Blob,
@@ -438,13 +566,20 @@ export async function verifyResidualWatermark(
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return { passed: false, fraction: 1 };
 
+    const sampleTimes = residualSampleTimes(
+      detection.trajectory,
+      duration,
+      RESIDUAL_SAMPLE_COUNT
+    );
+
     let totalMask = 0;
     let totalArea = 0;
-    const n = RESIDUAL_SAMPLE_COUNT;
-    for (let i = 0; i < n; i++) {
+    let maxFraction = 0;
+    let clusterHit = false;
+
+    for (const t of sampleTimes) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      const t = duration * ((i + 0.5) / n);
-      await seekTo(video, Math.min(duration - 0.001, t));
+      await seekTo(video, t);
       ctx.drawImage(video, 0, 0, W, H);
       const bbox = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
       if (bbox.width <= 0 || bbox.height <= 0) continue;
@@ -463,13 +598,25 @@ export async function verifyResidualWatermark(
         const minC = Math.min(r, g, b);
         const sat = maxC - minC;
         const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (lum >= BRIGHT_THRESHOLD && sat <= LOW_SATURATION_THRESHOLD) hits++;
+        if (lum >= BRIGHT_THRESHOLD - 8 && sat <= LOW_SATURATION_THRESHOLD + 10) hits++;
       }
+      const frac = area > 0 ? hits / area : 0;
+      if (frac > maxFraction) maxFraction = frac;
       totalMask += hits;
       totalArea += area;
+
+      const cluster = largestBrightClusterInRoi(roi);
+      if (cluster && clusterMatchesLogoTextPrior(cluster)) {
+        clusterHit = true;
+      }
     }
+
     const fraction = totalArea > 0 ? totalMask / totalArea : 1;
-    return { passed: fraction <= RESIDUAL_FAIL_FRACTION, fraction };
+    const passed =
+      !clusterHit &&
+      fraction <= RESIDUAL_FAIL_FRACTION &&
+      maxFraction <= RESIDUAL_FAIL_FRACTION_MAX;
+    return { passed, fraction: Math.max(fraction, maxFraction) };
   } finally {
     video.removeAttribute('src');
     video.load();
@@ -713,10 +860,12 @@ function bboxAtTime(
 }
 
 function padBox(b: WatermarkCoords, padding: number, W: number, H: number): WatermarkCoords {
-  const x = clamp(b.x - padding, 0, W - 1);
-  const y = clamp(b.y - padding, 0, H - 1);
-  const width = clamp(b.width + padding * 2, 1, W - x);
-  const height = clamp(b.height + padding * 2, 1, H - y);
+  const padX = padding + DEFAULT_PADDING_X_EXTRA;
+  const padY = padding;
+  const x = clamp(b.x - padX, 0, W - 1);
+  const y = clamp(b.y - padY, 0, H - 1);
+  const width = clamp(b.width + padX * 2, 1, W - x);
+  const height = clamp(b.height + padY * 2, 1, H - y);
   return { x, y, width, height };
 }
 
@@ -725,28 +874,74 @@ function boxesOverlap(a: WatermarkCoords, b: WatermarkCoords): boolean {
            a.y + a.height <= b.y || b.y + b.height <= a.y);
 }
 
-function pickReferenceForBox(
-  references: { time: number; canvas: HTMLCanvasElement; bbox: WatermarkCoords }[],
+type RefFrame = { time: number; canvas: HTMLCanvasElement; bbox: WatermarkCoords };
+
+/**
+ * Rank clean donor frames for the current ROI. Prefers non-overlapping
+ * watermark bboxes (donor is clean), then temporal proximity. Returns up to
+ * `MULTI_REF_BLEND` candidates for multi-ref blending.
+ */
+function pickReferencesForBox(
+  references: RefFrame[],
   currentTime: number,
-  bbox: WatermarkCoords
-): { time: number; canvas: HTMLCanvasElement; bbox: WatermarkCoords } | null {
-  // Prefer references whose own watermark bbox does NOT overlap the current
-  // bbox (so the donor pixels are clean). Among those, prefer the temporally
-  // closest one. Fall back to the temporally closest reference even if
-  // overlapping (rare with reasonable refCount).
-  let bestClean: typeof references[number] | null = null;
-  let bestCleanDt = Infinity;
-  let bestAny: typeof references[number] | null = null;
+  bbox: WatermarkCoords,
+  limit: number = MULTI_REF_BLEND
+): RefFrame[] {
+  const scored: { ref: RefFrame; score: number }[] = [];
+  for (const ref of references) {
+    const dt = Math.abs(ref.time - currentTime);
+    // Skip near-identical times (same frame / almost same watermark pose).
+    if (dt < 0.04) continue;
+    const clean = !boxesOverlap(ref.bbox, bbox);
+    // Higher is better: clean donors strongly preferred; nearer in time next.
+    const score = (clean ? 1000 : 0) - dt;
+    scored.push({ ref, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const picked = scored.slice(0, Math.max(1, limit)).map(s => s.ref);
+  if (picked.length > 0) return picked;
+  // Absolute fallback: temporally closest even if overlapping / same time.
+  let bestAny: RefFrame | null = null;
   let bestAnyDt = Infinity;
   for (const ref of references) {
     const dt = Math.abs(ref.time - currentTime);
     if (dt < bestAnyDt) { bestAnyDt = dt; bestAny = ref; }
-    if (!boxesOverlap(ref.bbox, bbox) && dt < bestCleanDt) {
-      bestCleanDt = dt;
-      bestClean = ref;
+  }
+  return bestAny ? [bestAny] : [];
+}
+
+/** Mean absolute RGB error on non-mask border ring — lower = better scene match. */
+function edgeMatchCost(
+  current: ImageData,
+  donor: ImageData,
+  alpha: Uint8ClampedArray,
+  bw: number,
+  bh: number
+): number {
+  let sum = 0;
+  let n = 0;
+  const ring = 2;
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const i = y * bw + x;
+      if (alpha[i] > 40) continue; // only compare outside / soft edge of mask
+      const onBorder =
+        x < ring || y < ring || x >= bw - ring || y >= bh - ring ||
+        (alpha[i] > 0 && alpha[i] < 180);
+      if (!onBorder && alpha[i] === 0) {
+        // Sample a sparse interior-clean check too (every 4th pixel).
+        if ((x + y) % 4 !== 0) continue;
+      } else if (!onBorder) {
+        continue;
+      }
+      const p = i * 4;
+      sum += Math.abs(current.data[p] - donor.data[p])
+           + Math.abs(current.data[p + 1] - donor.data[p + 1])
+           + Math.abs(current.data[p + 2] - donor.data[p + 2]);
+      n++;
     }
   }
-  return bestClean ?? bestAny;
+  return n > 0 ? sum / n : 1e9;
 }
 
 /**
@@ -765,7 +960,55 @@ const patchScratch: {
 };
 
 /**
+ * Morphological dilate (square kernel) of a binary mask.
+ */
+function dilateBinary(src: Uint8Array, bw: number, bh: number, radius: number): Uint8Array {
+  if (radius <= 0) return src;
+  const out = new Uint8Array(bw * bh);
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      let on = 0;
+      for (let dy = -radius; dy <= radius && !on; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= bh) continue;
+        for (let dx = -radius; dx <= radius; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= bw) continue;
+          if (src[yy * bw + xx]) { on = 1; break; }
+        }
+      }
+      out[y * bw + x] = on;
+    }
+  }
+  return out;
+}
+
+/**
+ * Morphological erode (square kernel) of a binary mask.
+ */
+function erodeBinary(src: Uint8Array, bw: number, bh: number, radius: number): Uint8Array {
+  if (radius <= 0) return src;
+  const out = new Uint8Array(bw * bh);
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      let on = 1;
+      for (let dy = -radius; dy <= radius && on; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= bh) { on = 0; break; }
+        for (let dx = -radius; dx <= radius; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= bw || !src[yy * bw + xx]) { on = 0; break; }
+        }
+      }
+      out[y * bw + x] = on;
+    }
+  }
+  return out;
+}
+
+/**
  * Build a soft alpha mask of bright translucent watermark pixels inside the ROI.
+ * Dilate + morphological close covers thin glyphs; feather softens edges.
  * Only these pixels are replaced — avoids ghosting from naive full-bbox paste on cuts.
  */
 function buildBrightMaskInRoi(
@@ -781,40 +1024,27 @@ function buildBrightMaskInRoi(
     const minC = Math.min(r, g, b);
     const sat = maxC - minC;
     const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-    // Slightly softer than detection so soft AA edges are covered.
-    if (lum >= BRIGHT_THRESHOLD - 12 && sat <= LOW_SATURATION_THRESHOLD + 15) {
+    // Softer than detection so thin glyphs and soft AA edges are covered.
+    if (lum >= BRIGHT_THRESHOLD - 28 && sat <= LOW_SATURATION_THRESHOLD + 28) {
       binary[i] = 1;
       hitCount++;
     }
   }
 
-  // Dilate
-  const dilate = MASK_DILATE_PX;
-  const dilated = dilate > 0 ? new Uint8Array(bw * bh) : binary;
-  if (dilate > 0) {
-    for (let y = 0; y < bh; y++) {
-      for (let x = 0; x < bw; x++) {
-        let on = 0;
-        for (let dy = -dilate; dy <= dilate && !on; dy++) {
-          const yy = y + dy;
-          if (yy < 0 || yy >= bh) continue;
-          for (let dx = -dilate; dx <= dilate; dx++) {
-            const xx = x + dx;
-            if (xx < 0 || xx >= bw) continue;
-            if (binary[yy * bw + xx]) { on = 1; break; }
-          }
-        }
-        dilated[y * bw + x] = on;
-      }
-    }
+  // Dilate aggressively, then morphological close (dilate+erode) to bridge thin text.
+  let mask = dilateBinary(binary, bw, bh, MASK_DILATE_PX);
+  if (MASK_CLOSE_PX > 0) {
+    mask = dilateBinary(mask, bw, bh, MASK_CLOSE_PX);
+    mask = erodeBinary(mask, bw, bh, MASK_CLOSE_PX);
   }
 
   // Distance-based feather: alpha falls off within FEATHER_PIXELS of mask edge.
+  // Smoothstep for a softer blend into surrounding content.
   const feather = FEATHER_PIXELS;
   for (let y = 0; y < bh; y++) {
     for (let x = 0; x < bw; x++) {
       const i = y * bw + x;
-      if (!dilated[i]) {
+      if (!mask[i]) {
         outAlpha[i] = 0;
         continue;
       }
@@ -822,7 +1052,6 @@ function buildBrightMaskInRoi(
         outAlpha[i] = 255;
         continue;
       }
-      // Approximate distance to nearest off pixel (capped at feather).
       let minDist = feather;
       for (let dy = -feather; dy <= feather; dy++) {
         const yy = y + dy;
@@ -830,14 +1059,16 @@ function buildBrightMaskInRoi(
         for (let dx = -feather; dx <= feather; dx++) {
           const xx = x + dx;
           if (xx < 0 || xx >= bw) continue;
-          if (!dilated[yy * bw + xx]) {
+          if (!mask[yy * bw + xx]) {
             const d = Math.hypot(dx, dy);
             if (d < minDist) minDist = d;
           }
         }
       }
-      const a = clamp(minDist / feather, 0, 1);
-      outAlpha[i] = Math.round(a * 255);
+      const t = clamp(minDist / feather, 0, 1);
+      // smoothstep
+      const s = t * t * (3 - 2 * t);
+      outAlpha[i] = Math.round(s * 255);
     }
   }
   return hitCount;
@@ -854,8 +1085,8 @@ function patchRegion(
   H: number
 ): void {
   if (bbox.width <= 0 || bbox.height <= 0) return;
-  const ref = pickReferenceForBox(references, currentTime, bbox);
-  if (!ref) return;
+  const refs = pickReferencesForBox(references, currentTime, bbox, MULTI_REF_BLEND);
+  if (refs.length === 0) return;
 
   const bw = bbox.width;
   const bh = bbox.height;
@@ -873,7 +1104,6 @@ function patchRegion(
   // Nothing bright/translucent here — skip (avoids pasting on empty ROIs).
   if (hitCount === 0) return;
 
-  // Read donor ROI from the temporally clean reference frame.
   if (!patchScratch.refCanvas) {
     patchScratch.refCanvas = document.createElement('canvas');
     patchScratch.refCtx = patchScratch.refCanvas.getContext('2d', { willReadFrequently: true });
@@ -885,35 +1115,54 @@ function patchRegion(
     refCanvas.width = bw;
     refCanvas.height = bh;
   }
-  refCtx.clearRect(0, 0, bw, bh);
-  refCtx.drawImage(
-    ref.canvas,
-    bbox.x, bbox.y, bw, bh,
-    0, 0, bw, bh
-  );
-  let donor: ImageData;
-  try {
-    donor = refCtx.getImageData(0, 0, bw, bh);
-  } catch {
-    return;
-  }
 
-  // Composite donor ONLY where the per-frame mask is on; feather soft edges.
+  // Pull donor ROIs and score by edge color match (reject cut-mismatched pastes).
+  type ScoredDonor = { data: Uint8ClampedArray; weight: number };
+  const donors: ScoredDonor[] = [];
+  for (const ref of refs) {
+    refCtx.clearRect(0, 0, bw, bh);
+    refCtx.drawImage(ref.canvas, bbox.x, bbox.y, bw, bh, 0, 0, bw, bh);
+    let donor: ImageData;
+    try {
+      donor = refCtx.getImageData(0, 0, bw, bh);
+    } catch {
+      continue;
+    }
+    const cost = edgeMatchCost(roi, donor, alpha, bw, bh);
+    // Convert cost → weight; very mismatched donors get near-zero weight.
+    const weight = 1 / (1 + cost / 18);
+    if (weight < 0.08 && donors.length > 0) continue; // skip bad cut match if we have alternatives
+    donors.push({ data: new Uint8ClampedArray(donor.data), weight });
+  }
+  if (donors.length === 0) return;
+
+  // Normalize weights.
+  let wSum = 0;
+  for (const d of donors) wSum += d.weight;
+  if (wSum <= 0) return;
+  for (const d of donors) d.weight /= wSum;
+
+  // Multi-ref blend ONLY where the per-frame mask is on; feather soft edges.
   const out = roi.data;
-  const src = donor.data;
   for (let i = 0, p = 0; i < bw * bh; i++, p += 4) {
     const a = alpha[i];
     if (a === 0) continue;
+    let sr = 0, sg = 0, sb = 0;
+    for (const d of donors) {
+      sr += d.data[p] * d.weight;
+      sg += d.data[p + 1] * d.weight;
+      sb += d.data[p + 2] * d.weight;
+    }
     if (a === 255) {
-      out[p] = src[p];
-      out[p + 1] = src[p + 1];
-      out[p + 2] = src[p + 2];
+      out[p] = Math.round(sr);
+      out[p + 1] = Math.round(sg);
+      out[p + 2] = Math.round(sb);
       continue;
     }
     const t = a / 255;
-    out[p]     = Math.round(src[p] * t + out[p] * (1 - t));
-    out[p + 1] = Math.round(src[p + 1] * t + out[p + 1] * (1 - t));
-    out[p + 2] = Math.round(src[p + 2] * t + out[p + 2] * (1 - t));
+    out[p]     = Math.round(sr * t + out[p] * (1 - t));
+    out[p + 1] = Math.round(sg * t + out[p + 1] * (1 - t));
+    out[p + 2] = Math.round(sb * t + out[p + 2] * (1 - t));
   }
   ctx.putImageData(roi, bbox.x, bbox.y);
 

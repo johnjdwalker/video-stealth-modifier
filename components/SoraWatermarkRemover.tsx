@@ -415,8 +415,8 @@ const SoraWatermarkRemover: React.FC<SoraWatermarkRemoverProps> = ({
                 </h4>
                 <p className={`text-sm mb-3 ${residualPassed ? 'text-emerald-200' : 'text-amber-100'}`}>
                   {residualPassed
-                    ? `Your processed video is ready (${state.processedMimeType?.includes('mp4') ? 'MP4' : 'WEBM'}). Residual check passed.`
-                    : `Bright translucent pixels remain in the watermark region (~${Math.round((state.residualFraction ?? 0) * 1000) / 10}% of ROI). Download and review, or try High quality / Manual region.`}
+                    ? `Your processed video is ready (${state.processedMimeType?.includes('mp4') ? 'MP4' : 'WEBM'}). Residual check passed — no readable logo+text cluster found along the trajectory.`
+                    : `Residual check failed: bright translucent logo/text still matches in the watermark ROI (~${Math.round((state.residualFraction ?? 0) * 1000) / 10}% peak). Status: Partial. Download and review, or try High quality / Manual region.`}
                 </p>
                 <div className="flex flex-col sm:flex-row gap-3">
                   <a
