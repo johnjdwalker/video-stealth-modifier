@@ -78,6 +78,11 @@ const SORA_WM_DEBUG_DEFAULT = false;
 const CORNER_DRIFT_PAD_PX = 8;
 // Extra opaque-cover inset beyond padded bbox (catches AA / breathing edges).
 const OPAQUE_COVER_EXTRA_PX = 6;
+// Always-on multi-corner cover — removal must not depend on single-slot pick.
+// Forensic strip: height ≈ 3.5% H; width ≈ 2.2–2.8× height; ≥8px micro-drift pad.
+const ALWAYS_ON_COVER_WIDTH_MULT = 2.6;
+const ALWAYS_ON_INCLUDE_MID_EDGES = true; // ML/MR/TC/BC — still cheap vs 9-slot morph
+const ALWAYS_ON_EDGE_INSET_PX = CORNER_DRIFT_PAD_PX; // ≥8px from frame edge
 // Morphological close radius (work-res) before connected components — merges glyph strokes.
 const DETECT_CLOSE_PX = 5;
 // (Trajectory is piecewise-constant across slot hops; no spatial lerp.)
@@ -315,9 +320,9 @@ interface SoraRemovalOptions {
 }
 
 /**
- * Removes a moving Sora-style watermark by re-encoding the video, replacing
- * each frame's watermarked region with content sourced from another point in
- * time when the watermark was elsewhere. Edges are feathered for seamless blending.
+ * Removes a moving Sora-style watermark by re-encoding the video and applying
+ * fastOpaqueCover to fixed forensic ROIs at all four corners (and optional
+ * mid-edges) on every frame. Reliability does not depend on single-slot pick.
  */
 export async function removeSoraWatermark(
   videoFile: File,
@@ -336,14 +341,6 @@ export async function removeSoraWatermark(
   video.muted = true;
   video.playsInline = true;
   video.src = url;
-
-  // Reference frame canvases (kept on offscreen canvases for cheap drawImage).
-  type Reference = {
-    time: number;
-    canvas: HTMLCanvasElement;
-    bbox: WatermarkCoords;
-  };
-  let references: Reference[] = [];
 
   let mediaRecorder: MediaRecorder | null = null;
   let audioContext: AudioContext | null = null;
@@ -370,35 +367,9 @@ export async function removeSoraWatermark(
     const H = video.videoHeight;
     const duration = isFinite(video.duration) ? video.duration : detection.videoDuration;
 
-    // Pick reference frame times spread across the video.
-    const refCount = REFERENCE_FRAME_COUNTS[quality];
-    const refTimes: number[] = [];
-    for (let i = 0; i < refCount; i++) {
-      const t = duration * ((i + 0.5) / refCount);
-      refTimes.push(Math.min(duration - 0.001, Math.max(0, t)));
-    }
-
-    // Pre-extract reference frames into offscreen canvases.
-    onProgress?.(0, 'Extracting reference frames');
-    for (let i = 0; i < refTimes.length; i++) {
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      const t = refTimes[i];
-      await seekTo(video, t);
-      const refCanvas = document.createElement('canvas');
-      refCanvas.width = W;
-      refCanvas.height = H;
-      const refCtx = refCanvas.getContext('2d', { alpha: false });
-      if (!refCtx) throw new Error('Could not allocate canvas for reference frame.');
-      refCtx.drawImage(video, 0, 0, W, H);
-      references.push({
-        time: t,
-        canvas: refCanvas,
-        bbox: bboxAtTime(detection.trajectory, t, W, H, detection.padding),
-      });
-      onProgress?.(((i + 1) / refTimes.length) * 25, 'Extracting reference frames');
-    }
-
-    // Reset video to start for the recording pass.
+    // Always-on opaque cover skips heavy multi-ref extract (API quality retained).
+    void REFERENCE_FRAME_COUNTS[quality];
+    onProgress?.(8, `Preparing always-on cover (${quality})`);
     await seekTo(video, 0);
 
     // Recording canvas
@@ -407,11 +378,6 @@ export async function removeSoraWatermark(
     canvas.height = H;
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) throw new Error('Could not allocate recording canvas.');
-
-    // Feather mask canvas (radial alpha gradient, sized once).
-    const maskCanvas = document.createElement('canvas');
-    const maskCtx = maskCanvas.getContext('2d');
-    if (!maskCtx) throw new Error('Could not allocate mask canvas.');
 
     // Audio passthrough
     audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -457,7 +423,11 @@ export async function removeSoraWatermark(
       };
     });
 
-    // Downscaled canvas for throttled slot scoring (never getImageData full-res in RAF).
+    // Fixed always-on covers: four corners (+ optional mid-edges). Removal does
+    // NOT depend on which slot "won" — single-slot tracking was misaligned (~70%).
+    const alwaysOnCovers = buildAlwaysOnCoverRois(W, H);
+
+    // Optional throttled slot detect for residual scoring / debug only.
     const detectScale = Math.min(1, REMOVAL_DETECT_WORK_WIDTH / W);
     const detectW = Math.max(64, Math.round(W * detectScale));
     const detectH = Math.max(64, Math.round(H * detectScale));
@@ -467,23 +437,14 @@ export async function removeSoraWatermark(
     const detectCtx = detectCanvas.getContext('2d', { willReadFrequently: true, alpha: false });
     if (!detectCtx) throw new Error('Could not allocate detect canvas.');
 
-    let snapCount = 0;
     let lastSlotId: SlotId | null = null;
     let nuclearAppliedTotal = 0;
     let lastDebugSec = -1;
     let lastDetectMs = -Infinity;
-    // Live cover set: replaced on each detect tick (no stale TL after hop to MR).
-    let liveCoverBoxes: WatermarkCoords[] = [];
-    let liveLocalized = false;
+    let debugSnapCount = 0;
 
-    const scaleBoxUp = (b: WatermarkCoords): WatermarkCoords => ({
-      x: Math.round(b.x / detectScale),
-      y: Math.round(b.y / detectScale),
-      width: Math.round(b.width / detectScale),
-      height: Math.round(b.height / detectScale),
-    });
-
-    const refreshLiveSlots = () => {
+    const refreshDebugSlot = () => {
+      // Slot detect is optional (scoring/debug) — never drives cover ROIs.
       if (!detectCtx) return;
       detectCtx.drawImage(canvas, 0, 0, detectW, detectH);
       let frame: ImageData;
@@ -495,64 +456,19 @@ export async function removeSoraWatermark(
       const strong = collectStrongSlotPicks(
         frame, detectW, detectH, SNAP_MIN_SCORE * 0.85, { requireEyes: true }
       );
-      const next: WatermarkCoords[] = [];
-      let debugSlot: SlotId | null = null;
       if (strong.length > 0) {
-        liveLocalized = true;
-        snapCount++;
         lastSlotId = strong[0].slot;
-        debugSlot = strong[0].slot;
-        const top = strong[0].score;
-        for (const p of strong) {
-          // Only near-best with real watermark signature (eyes already gated).
-          if (p.score < top * 0.78 && next.length >= 1) break;
-          const full = clampBox(scaleBoxUp(p.bbox), W, H);
-          next.push(expandBoxForDrift(padBox(full, detection.padding, W, H), W, H));
-          if (next.length >= 2) break;
-        }
-      } else {
-        const pick = pickBestSlot(frame, detectW, detectH, null, {
-          sticky: false,
-          requireEyes: true,
-        });
-        if (pick && pick.score >= SNAP_MIN_SCORE * 0.75 && pick.eye >= REMOVAL_MIN_EYE * 0.85) {
-          const full = clampBox(scaleBoxUp(pick.bbox), W, H);
-          next.push(expandBoxForDrift(padBox(full, detection.padding, W, H), W, H));
-          lastSlotId = pick.slot;
-          debugSlot = pick.slot;
-          liveLocalized = true;
-          snapCount++;
-        }
+        debugSnapCount++;
+        return;
       }
-
-      if (next.length === 0) {
-        // Trajectory hold only when live signature missing — still one box, no dual ghost.
-        const predicted = bboxAtTime(detection.trajectory, video.currentTime, W, H, detection.padding);
-        const snap = snapBboxToLocalBright(ctx, predicted, W, H, detection.padding);
-        next.push(expandBoxForDrift(snap.bbox, W, H));
-        if (snap.snapped) {
-          snapCount++;
-          liveLocalized = true;
-          lastSlotId = slotIdOfPoint(
-            snap.bbox.x + snap.bbox.width / 2, snap.bbox.y + snap.bbox.height / 2, W, H
-          );
-          debugSlot = lastSlotId;
-        } else {
-          liveLocalized = false;
-          debugSlot = lastSlotId;
-        }
+      const pick = pickBestSlot(frame, detectW, detectH, lastSlotId, {
+        sticky: false,
+        requireEyes: true,
+      });
+      if (pick && pick.score >= SNAP_MIN_SCORE * 0.75 && pick.eye >= REMOVAL_MIN_EYE * 0.85) {
+        lastSlotId = pick.slot;
+        debugSnapCount++;
       }
-
-      // Replace entirely — never keep previous TL when mark hopped to MR.
-      liveCoverBoxes = next;
-      // Full-quality patch once per detect tick (ROI-sized, ~10 Hz) — cheap vs full-frame.
-      const tNow = video.currentTime;
-      for (const bbox of liveCoverBoxes) {
-        if (patchRegion(ctx, maskCtx, maskCanvas, references, tNow, bbox, W, H, quality)) {
-          nuclearAppliedTotal++;
-        }
-      }
-      void debugSlot;
     };
 
     const drawFrame = () => {
@@ -575,23 +491,17 @@ export async function removeSoraWatermark(
         return;
       }
 
-      // Always paint base + cover so captureStream gets a video frame this tick.
+      // Always paint base + all fixed covers so captureStream gets a video frame.
       ctx.drawImage(video, 0, 0, W, H);
 
       const now = performance.now();
       if (now - lastDetectMs >= REMOVAL_DETECT_INTERVAL_MS) {
         lastDetectMs = now;
-        refreshLiveSlots();
-      }
-
-      // If detect hasn't run yet, seed from trajectory so first frames aren't bare.
-      if (liveCoverBoxes.length === 0) {
-        const predicted = bboxAtTime(detection.trajectory, video.currentTime, W, H, detection.padding);
-        liveCoverBoxes = [expandBoxForDrift(predicted, W, H)];
+        refreshDebugSlot();
       }
 
       let nuclearApplied = false;
-      for (const bbox of liveCoverBoxes) {
+      for (const bbox of alwaysOnCovers) {
         if (fastOpaqueCover(ctx, bbox, W, H)) nuclearApplied = true;
       }
       if (nuclearApplied) nuclearAppliedTotal++;
@@ -601,21 +511,21 @@ export async function removeSoraWatermark(
         const sec = Math.floor(t);
         if (sec !== lastDebugSec) {
           lastDebugSec = sec;
-          const b = liveCoverBoxes[0];
+          const b = alwaysOnCovers[0];
           console.log(
-            `[sora-wm] t=${t.toFixed(2)}s slot=${lastSlotId ?? '?'} ` +
-            `boxes=${liveCoverBoxes.length} bbox=${b ? `${b.x},${b.y} ${b.width}x${b.height}` : 'none'} ` +
-            `nuclearTotal=${nuclearAppliedTotal}`
+            `[sora-wm] t=${t.toFixed(2)}s debugSlot=${lastSlotId ?? '?'} ` +
+            `alwaysOn=${alwaysOnCovers.length} tl=${b ? `${b.x},${b.y} ${b.width}x${b.height}` : 'none'} ` +
+            `snaps=${debugSnapCount} nuclearTotal=${nuclearAppliedTotal}`
           );
         }
       }
 
       if (duration > 0) {
         const pct = 25 + (t / duration) * 75;
-        const note = liveLocalized
-          ? `Reconstructing frames (slot=${lastSlotId ?? '?'}, covers=${liveCoverBoxes.length}, nuclearApplied=${nuclearAppliedTotal})`
-          : `Reconstructing frames (hold predict, nuclearApplied=${nuclearAppliedTotal})`;
-        onProgress?.(Math.min(99.9, pct), note);
+        onProgress?.(
+          Math.min(99.9, pct),
+          `Reconstructing frames (always-on covers=${alwaysOnCovers.length}, nuclearApplied=${nuclearAppliedTotal})`
+        );
       }
       rafId = requestAnimationFrame(drawFrame);
     };
@@ -636,8 +546,7 @@ export async function removeSoraWatermark(
     onProgress?.(25, 'Reconstructing frames');
     // Seed a painted frame BEFORE start so the video track is not empty.
     ctx.drawImage(video, 0, 0, W, H);
-    refreshLiveSlots();
-    for (const bbox of liveCoverBoxes) fastOpaqueCover(ctx, bbox, W, H);
+    for (const bbox of alwaysOnCovers) fastOpaqueCover(ctx, bbox, W, H);
 
     // Timeslice keeps chunks flowing even if stop is delayed; also forces encoder wakeups.
     mediaRecorder.start(RECORD_TIMESLICE_MS);
@@ -656,7 +565,6 @@ export async function removeSoraWatermark(
     };
   } finally {
     await cleanup();
-    references = [];
   }
 }
 
@@ -777,9 +685,9 @@ function clusterMatchesLogoTextPrior(cluster: { pixels: number; aspect: number; 
 }
 
 /**
- * Sample frames from the cleaned output along the watermark trajectory and
- * measure remaining bright translucent clusters inside the expected ROI.
- * Fails (so UI shows Partial) if residual logo+text prior still matches.
+ * Sample cleaned frames and measure residual bright translucent clusters inside
+ * the always-on corner/mid-edge cover ROIs (plus trajectory hold). Fails so UI
+ * shows Partial only if logo+text prior still matches after multi-corner cover.
  */
 export async function verifyResidualWatermark(
   cleanedBlob: Blob,
@@ -811,6 +719,7 @@ export async function verifyResidualWatermark(
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return { passed: false, fraction: 1 };
 
+    const coverRois = buildAlwaysOnCoverRois(W, H);
     const sampleTimes = residualSampleTimes(
       detection.trajectory,
       duration,
@@ -822,17 +731,13 @@ export async function verifyResidualWatermark(
     let maxFraction = 0;
     let clusterHit = false;
 
-    for (const t of sampleTimes) {
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      await seekTo(video, t);
-      ctx.drawImage(video, 0, 0, W, H);
-      const bbox = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
-      if (bbox.width <= 0 || bbox.height <= 0) continue;
+    const scoreRoi = (bbox: WatermarkCoords) => {
+      if (bbox.width <= 0 || bbox.height <= 0) return;
       let roi: ImageData;
       try {
-        roi = ctx.getImageData(bbox.x, bbox.y, bbox.width, bbox.height);
+        roi = ctx!.getImageData(bbox.x, bbox.y, bbox.width, bbox.height);
       } catch {
-        continue;
+        return;
       }
       const data = roi.data;
       let hits = 0;
@@ -854,6 +759,16 @@ export async function verifyResidualWatermark(
       if (cluster && clusterMatchesLogoTextPrior(cluster)) {
         clusterHit = true;
       }
+    };
+
+    for (const t of sampleTimes) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      await seekTo(video, t);
+      ctx.drawImage(video, 0, 0, W, H);
+      // Honesty vs multi-corner cover: check every always-on ROI.
+      for (const bbox of coverRois) scoreRoi(bbox);
+      // Also trajectory hold — Partial if that slot still glows.
+      scoreRoi(bboxAtTime(detection.trajectory, t, W, H, detection.padding));
     }
 
     const fraction = totalArea > 0 ? totalMask / totalArea : 1;
@@ -1516,6 +1431,42 @@ function expandBoxForDrift(b: WatermarkCoords, W: number, H: number): WatermarkC
   const width = clamp(Math.round(b.width + pad * 2), 1, W - x);
   const height = clamp(Math.round(b.height + pad * 2), 1, H - y);
   return { x, y, width, height };
+}
+
+/**
+ * Fixed forensic ROIs for always-on cover: TL/TR/BL/BR (+ optional mid-edges).
+ * Size from MARK_HEIGHT_FRAC × width mult; inset ≥8px for corner micro-drift.
+ * Removal paints all of these every frame — no single-slot dependency.
+ */
+function buildAlwaysOnCoverRois(
+  W: number,
+  H: number,
+  includeMidEdges: boolean = ALWAYS_ON_INCLUDE_MID_EDGES
+): WatermarkCoords[] {
+  const markH = Math.max(10, Math.round(H * MARK_HEIGHT_FRAC));
+  const markW = Math.max(markH + 8, Math.round(markH * ALWAYS_ON_COVER_WIDTH_MULT));
+  const inset = Math.max(8, ALWAYS_ON_EDGE_INSET_PX);
+  const rois: WatermarkCoords[] = [];
+  const place = (x: number, y: number) => {
+    const raw = clampBox(
+      { x: Math.round(x), y: Math.round(y), width: markW, height: markH },
+      W, H
+    );
+    rois.push(expandBoxForDrift(raw, W, H));
+  };
+  place(inset, inset);                               // TL
+  place(W - markW - inset, inset);                   // TR
+  place(inset, H - markH - inset);                   // BL
+  place(W - markW - inset, H - markH - inset);       // BR
+  if (includeMidEdges) {
+    const mx = Math.round((W - markW) / 2);
+    const my = Math.round((H - markH) / 2);
+    place(mx, inset);                                // TC
+    place(mx, H - markH - inset);                    // BC
+    place(inset, my);                                // ML
+    place(W - markW - inset, my);                    // MR
+  }
+  return rois;
 }
 
 function isSoraWmDebug(): boolean {
@@ -2283,3 +2234,7 @@ function patchRegion(
   void W; void H;
   return forceNuclear;
 }
+
+// Retain snap/patch helpers for manual ROI / future donor-fill tiers.
+void snapBboxToLocalBright;
+void patchRegion;
