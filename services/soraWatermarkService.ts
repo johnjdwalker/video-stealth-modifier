@@ -18,35 +18,47 @@ import {
 //      every covered pixel.
 // ----------------------------------------------------------------------------
 
-const DETECTION_TARGET_SAMPLES = 36;        // how many frames to sample for detection
-const DETECTION_MAX_SAMPLE_INTERVAL = 1.0;  // seconds; clamps very long videos
-const DETECTION_MIN_SAMPLE_INTERVAL = 0.15; // seconds; clamps very short videos
+const DETECTION_TARGET_SAMPLES = 72;        // denser trajectory sampling along the clip
+const DETECTION_MAX_SAMPLE_INTERVAL = 0.45; // seconds; clamps very long videos
+const DETECTION_MIN_SAMPLE_INTERVAL = 0.08; // seconds; clamps very short videos
 
 // Luminance threshold (0-255). Pixels brighter than this are watermark candidates.
 const BRIGHT_THRESHOLD = 200;
 // Saturation threshold (0-255 max-min). Below this is "white-ish".
 const LOW_SATURATION_THRESHOLD = 60;
-// Working resolution for detection (downscaled). Smaller = faster, less accurate.
-const DETECTION_WORK_WIDTH = 320;
+// Working resolution for detection (downscaled). Higher = more accurate logos/text.
+const DETECTION_WORK_WIDTH = 640;
 
 // Watermark size constraints, expressed as fractions of the video's longer side.
 // Sora's logo is small relative to the frame.
 const MIN_WATERMARK_FRAC = 0.02;
 const MAX_WATERMARK_FRAC = 0.30;
 
+// Sora logo+text strip aspect prior (width/height). Typical strip is wide.
+const ASPECT_PRIOR_MIN = 1.4;
+const ASPECT_PRIOR_MAX = 7.0;
+const ASPECT_PRIOR_SOFT_MIN = 1.0;
+const ASPECT_PRIOR_SOFT_MAX = 9.0;
+
 // Reference frame counts per quality level. More references = better fill, more memory.
 const REFERENCE_FRAME_COUNTS: Record<SoraRemovalQuality, number> = {
-  fast: 4,
-  balanced: 8,
-  high: 14,
+  fast: 6,
+  balanced: 10,
+  high: 16,
 };
 
-// Feathering width (in pixels at full resolution) around the patched region.
-const FEATHER_PIXELS = 6;
+// Feathering radius (in pixels at full resolution) around the per-frame mask.
+const FEATHER_PIXELS = 4;
+// Dilate the bright-pixel mask slightly so soft AA edges are covered.
+const MASK_DILATE_PX = 2;
 
 // Padding (in pixels at full resolution) added around each detected bbox to
 // catch soft edges, antialiasing and slight motion between sampled frames.
-const DEFAULT_PADDING = 10;
+const DEFAULT_PADDING = 12;
+
+// Residual verification: fraction of ROI bright pixels that may remain after removal.
+const RESIDUAL_FAIL_FRACTION = 0.045;
+const RESIDUAL_SAMPLE_COUNT = 8;
 
 // ----------------------------------------------------------------------------
 // Public API
@@ -220,7 +232,7 @@ export async function removeSoraWatermark(
   detection: SoraWatermarkDetection,
   onProgress?: (progress: number, stage?: string) => void,
   options: SoraRemovalOptions = {}
-): Promise<{ blob: Blob; mimeType: string }> {
+): Promise<{ blob: Blob; mimeType: string; residualPassed: boolean; residualFraction: number }> {
   const { quality = 'balanced', outputMimeType, signal } = options;
   if (!detection.detected || detection.trajectory.length === 0) {
     throw new Error('No watermark trajectory to remove.');
@@ -376,12 +388,92 @@ export async function removeSoraWatermark(
     await video.play();
     await recordingDone;
 
-    onProgress?.(100, 'Finalizing');
+    onProgress?.(96, 'Checking residual watermark');
     const blob = new Blob(chunks, { type: mime });
-    return { blob, mimeType: mime };
+    const residual = await verifyResidualWatermark(blob, detection, signal);
+    onProgress?.(100, residual.passed ? 'Finalizing' : 'Partial removal — residual detected');
+    return {
+      blob,
+      mimeType: mime,
+      residualPassed: residual.passed,
+      residualFraction: residual.fraction,
+    };
   } finally {
     await cleanup();
     references = [];
+  }
+}
+
+/**
+ * Sample frames from the cleaned output and measure remaining bright translucent
+ * pixels inside the expected watermark trajectory ROI. Used for honest UI status.
+ */
+export async function verifyResidualWatermark(
+  cleanedBlob: Blob,
+  detection: SoraWatermarkDetection,
+  signal?: AbortSignal
+): Promise<{ passed: boolean; fraction: number }> {
+  if (!detection.detected || detection.trajectory.length === 0) {
+    return { passed: false, fraction: 1 };
+  }
+  const url = URL.createObjectURL(cleanedBlob);
+  const video = document.createElement('video');
+  video.preload = 'auto';
+  video.muted = true;
+  video.playsInline = true;
+  video.src = url;
+  try {
+    await waitForMetadata(video);
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const W = video.videoWidth || detection.videoWidth;
+    const H = video.videoHeight || detection.videoHeight;
+    const duration = isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : detection.videoDuration;
+    if (!W || !H || duration <= 0) return { passed: false, fraction: 1 };
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return { passed: false, fraction: 1 };
+
+    let totalMask = 0;
+    let totalArea = 0;
+    const n = RESIDUAL_SAMPLE_COUNT;
+    for (let i = 0; i < n; i++) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const t = duration * ((i + 0.5) / n);
+      await seekTo(video, Math.min(duration - 0.001, t));
+      ctx.drawImage(video, 0, 0, W, H);
+      const bbox = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
+      if (bbox.width <= 0 || bbox.height <= 0) continue;
+      let roi: ImageData;
+      try {
+        roi = ctx.getImageData(bbox.x, bbox.y, bbox.width, bbox.height);
+      } catch {
+        continue;
+      }
+      const data = roi.data;
+      let hits = 0;
+      const area = bbox.width * bbox.height;
+      for (let p = 0; p < data.length; p += 4) {
+        const r = data[p], g = data[p + 1], b = data[p + 2];
+        const maxC = Math.max(r, g, b);
+        const minC = Math.min(r, g, b);
+        const sat = maxC - minC;
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (lum >= BRIGHT_THRESHOLD && sat <= LOW_SATURATION_THRESHOLD) hits++;
+      }
+      totalMask += hits;
+      totalArea += area;
+    }
+    const fraction = totalArea > 0 ? totalMask / totalArea : 1;
+    return { passed: fraction <= RESIDUAL_FAIL_FRACTION, fraction };
+  } finally {
+    video.removeAttribute('src');
+    video.load();
+    URL.revokeObjectURL(url);
   }
 }
 
@@ -515,8 +607,8 @@ function findBrightTranslucentCluster(
 
   if (candidates.length === 0) return null;
 
-  // 3. Score candidates: density (filled fraction), proximity to previous box,
-  // and preference for boxes near edges (Sora logo bounces along edges).
+  // 3. Score candidates: density, logo+text strip aspect prior, proximity to
+  // previous box, and preference for boxes near edges (Sora logo bounces).
   let best: { score: number; bbox: WatermarkCoords; confidence: number } | null = null;
   for (const c of candidates) {
     const area = c.bbox.width * c.bbox.height;
@@ -534,18 +626,26 @@ function findBrightTranslucentCluster(
       motionBonus = 1 - clamp(dist / Math.hypot(W, H), 0, 1);
     }
 
-    // Score weights: density is paramount (logos are dense), edge bias and
-    // motion continuity refine the choice between similar candidates.
-    const score = density * 0.55 + edgeBonus * 0.20 + motionBonus * 0.25;
-    const confidence = Math.round(clamp(density * 100, 0, 100));
+    // Aspect prior: Sora watermark is a wide logo+text strip, not a square blob.
+    const aspect = c.bbox.width / Math.max(1, c.bbox.height);
+    let aspectBonus = 0.15;
+    if (aspect >= ASPECT_PRIOR_MIN && aspect <= ASPECT_PRIOR_MAX) {
+      aspectBonus = 1;
+    } else if (aspect >= ASPECT_PRIOR_SOFT_MIN && aspect <= ASPECT_PRIOR_SOFT_MAX) {
+      aspectBonus = 0.55;
+    }
+
+    // Score weights: density + aspect prior are key; edge/motion refine.
+    const score = density * 0.40 + aspectBonus * 0.25 + edgeBonus * 0.15 + motionBonus * 0.20;
+    const confidence = Math.round(clamp((density * 0.7 + aspectBonus * 0.3) * 100, 0, 100));
     if (!best || score > best.score) {
       best = { score, bbox: c.bbox, confidence };
     }
   }
 
   if (!best) return null;
-  // Reject low-density blobs (likely a bright object, not a logo).
-  if (best.score < 0.35) return null;
+  // Reject low-density / wrong-aspect blobs (likely a bright object, not a logo).
+  if (best.score < 0.32) return null;
   return { bbox: best.bbox, confidence: best.confidence };
 }
 
@@ -650,14 +750,98 @@ function pickReferenceForBox(
 }
 
 /**
- * Scratch canvas for compositing the donor patch. Reused across frames — a
- * fresh canvas per frame meant ~30 canvas allocations per second of output in
- * the hottest loop of the pipeline.
+ * Scratch canvases for compositing the donor patch. Reused across frames.
  */
-const patchScratch: { canvas: HTMLCanvasElement | null; ctx: CanvasRenderingContext2D | null } = {
+const patchScratch: {
+  canvas: HTMLCanvasElement | null;
+  ctx: CanvasRenderingContext2D | null;
+  refCtx: CanvasRenderingContext2D | null;
+  refCanvas: HTMLCanvasElement | null;
+} = {
   canvas: null,
   ctx: null,
+  refCtx: null,
+  refCanvas: null,
 };
+
+/**
+ * Build a soft alpha mask of bright translucent watermark pixels inside the ROI.
+ * Only these pixels are replaced — avoids ghosting from naive full-bbox paste on cuts.
+ */
+function buildBrightMaskInRoi(
+  roi: ImageData,
+  outAlpha: Uint8ClampedArray
+): number {
+  const { width: bw, height: bh, data } = roi;
+  const binary = new Uint8Array(bw * bh);
+  let hitCount = 0;
+  for (let i = 0, p = 0; i < bw * bh; i++, p += 4) {
+    const r = data[p], g = data[p + 1], b = data[p + 2];
+    const maxC = Math.max(r, g, b);
+    const minC = Math.min(r, g, b);
+    const sat = maxC - minC;
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    // Slightly softer than detection so soft AA edges are covered.
+    if (lum >= BRIGHT_THRESHOLD - 12 && sat <= LOW_SATURATION_THRESHOLD + 15) {
+      binary[i] = 1;
+      hitCount++;
+    }
+  }
+
+  // Dilate
+  const dilate = MASK_DILATE_PX;
+  const dilated = dilate > 0 ? new Uint8Array(bw * bh) : binary;
+  if (dilate > 0) {
+    for (let y = 0; y < bh; y++) {
+      for (let x = 0; x < bw; x++) {
+        let on = 0;
+        for (let dy = -dilate; dy <= dilate && !on; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= bh) continue;
+          for (let dx = -dilate; dx <= dilate; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= bw) continue;
+            if (binary[yy * bw + xx]) { on = 1; break; }
+          }
+        }
+        dilated[y * bw + x] = on;
+      }
+    }
+  }
+
+  // Distance-based feather: alpha falls off within FEATHER_PIXELS of mask edge.
+  const feather = FEATHER_PIXELS;
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const i = y * bw + x;
+      if (!dilated[i]) {
+        outAlpha[i] = 0;
+        continue;
+      }
+      if (feather <= 0) {
+        outAlpha[i] = 255;
+        continue;
+      }
+      // Approximate distance to nearest off pixel (capped at feather).
+      let minDist = feather;
+      for (let dy = -feather; dy <= feather; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= bh) continue;
+        for (let dx = -feather; dx <= feather; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= bw) continue;
+          if (!dilated[yy * bw + xx]) {
+            const d = Math.hypot(dx, dy);
+            if (d < minDist) minDist = d;
+          }
+        }
+      }
+      const a = clamp(minDist / feather, 0, 1);
+      outAlpha[i] = Math.round(a * 255);
+    }
+  }
+  return hitCount;
+}
 
 function patchRegion(
   ctx: CanvasRenderingContext2D,
@@ -673,61 +857,71 @@ function patchRegion(
   const ref = pickReferenceForBox(references, currentTime, bbox);
   if (!ref) return;
 
-  const feather = Math.min(FEATHER_PIXELS, Math.floor(Math.min(bbox.width, bbox.height) / 2));
+  const bw = bbox.width;
+  const bh = bbox.height;
 
-  // Build the feather mask (white center fading to transparent edges).
-  maskCanvas.width = bbox.width;
-  maskCanvas.height = bbox.height;
-  maskCtx.clearRect(0, 0, bbox.width, bbox.height);
-
-  // Solid white core with soft edges. We achieve this by stroking a series of
-  // increasingly transparent rectangles.
-  if (feather <= 0) {
-    maskCtx.fillStyle = 'white';
-    maskCtx.fillRect(0, 0, bbox.width, bbox.height);
-  } else {
-    const grad = maskCtx.createRadialGradient(
-      bbox.width / 2, bbox.height / 2, 0,
-      bbox.width / 2, bbox.height / 2, Math.max(bbox.width, bbox.height) / 2
-    );
-    grad.addColorStop(0, 'rgba(255,255,255,1)');
-    const innerStop = Math.max(0, 1 - feather / Math.max(bbox.width, bbox.height));
-    grad.addColorStop(innerStop, 'rgba(255,255,255,1)');
-    grad.addColorStop(1, 'rgba(255,255,255,0)');
-    maskCtx.fillStyle = grad;
-    maskCtx.fillRect(0, 0, bbox.width, bbox.height);
+  // Read current ROI (already drawn from the live frame).
+  let roi: ImageData;
+  try {
+    roi = ctx.getImageData(bbox.x, bbox.y, bw, bh);
+  } catch {
+    return;
   }
 
-  // Compose the donor patch into a small canvas so we can mask it cheaply.
-  if (!patchScratch.canvas) {
-    patchScratch.canvas = document.createElement('canvas');
-    patchScratch.ctx = patchScratch.canvas.getContext('2d');
+  const alpha = new Uint8ClampedArray(bw * bh);
+  const hitCount = buildBrightMaskInRoi(roi, alpha);
+  // Nothing bright/translucent here — skip (avoids pasting on empty ROIs).
+  if (hitCount === 0) return;
+
+  // Read donor ROI from the temporally clean reference frame.
+  if (!patchScratch.refCanvas) {
+    patchScratch.refCanvas = document.createElement('canvas');
+    patchScratch.refCtx = patchScratch.refCanvas.getContext('2d', { willReadFrequently: true });
   }
-  const patchCanvas = patchScratch.canvas;
-  const patchCtx = patchScratch.ctx;
-  if (!patchCtx) return;
-  // Assigning width/height also resets the canvas, so no explicit clear is
-  // needed when the size changes; clear explicitly when it does not.
-  if (patchCanvas.width !== bbox.width || patchCanvas.height !== bbox.height) {
-    patchCanvas.width = bbox.width;
-    patchCanvas.height = bbox.height;
-  } else {
-    patchCtx.clearRect(0, 0, bbox.width, bbox.height);
+  const refCanvas = patchScratch.refCanvas!;
+  const refCtx = patchScratch.refCtx;
+  if (!refCtx) return;
+  if (refCanvas.width !== bw || refCanvas.height !== bh) {
+    refCanvas.width = bw;
+    refCanvas.height = bh;
   }
-  patchCtx.globalCompositeOperation = 'source-over';
-  patchCtx.drawImage(
+  refCtx.clearRect(0, 0, bw, bh);
+  refCtx.drawImage(
     ref.canvas,
-    bbox.x, bbox.y, bbox.width, bbox.height,
-    0, 0, bbox.width, bbox.height
+    bbox.x, bbox.y, bw, bh,
+    0, 0, bw, bh
   );
-  // Apply the feather mask to the patch using destination-in.
-  patchCtx.globalCompositeOperation = 'destination-in';
-  patchCtx.drawImage(maskCanvas, 0, 0);
-  patchCtx.globalCompositeOperation = 'source-over';
+  let donor: ImageData;
+  try {
+    donor = refCtx.getImageData(0, 0, bw, bh);
+  } catch {
+    return;
+  }
 
-  // Draw masked patch over the recording canvas.
-  ctx.drawImage(patchCanvas, bbox.x, bbox.y);
+  // Composite donor ONLY where the per-frame mask is on; feather soft edges.
+  const out = roi.data;
+  const src = donor.data;
+  for (let i = 0, p = 0; i < bw * bh; i++, p += 4) {
+    const a = alpha[i];
+    if (a === 0) continue;
+    if (a === 255) {
+      out[p] = src[p];
+      out[p + 1] = src[p + 1];
+      out[p + 2] = src[p + 2];
+      continue;
+    }
+    const t = a / 255;
+    out[p]     = Math.round(src[p] * t + out[p] * (1 - t));
+    out[p + 1] = Math.round(src[p + 1] * t + out[p + 1] * (1 - t));
+    out[p + 2] = Math.round(src[p + 2] * t + out[p + 2] * (1 - t));
+  }
+  ctx.putImageData(roi, bbox.x, bbox.y);
 
-  // Avoid unused-var warning on H (kept for future per-frame validation).
+  // Keep mask canvas sized for any legacy callers / debugging overlays.
+  if (maskCanvas.width !== bw || maskCanvas.height !== bh) {
+    maskCanvas.width = bw;
+    maskCanvas.height = bh;
+  }
+  void maskCtx;
   void W; void H;
 }

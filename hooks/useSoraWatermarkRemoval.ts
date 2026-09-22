@@ -11,6 +11,9 @@ const INITIAL_STATE: SoraRemovalState = {
   error: null,
   processedVideoUrl: null,
   processedMimeType: null,
+  processedBlob: null,
+  residualPassed: null,
+  residualFraction: null,
 };
 
 export function useSoraWatermarkRemoval() {
@@ -90,10 +93,13 @@ export function useSoraWatermarkRemoval() {
       error: null,
       processedVideoUrl: null,
       processedMimeType: null,
+      processedBlob: null,
+      residualPassed: null,
+      residualFraction: null,
     }));
 
     try {
-      const { blob, mimeType } = await removeSoraWatermark(
+      const { blob, mimeType, residualPassed, residualFraction } = await removeSoraWatermark(
         file,
         state.detection,
         (progress, stage) => {
@@ -112,9 +118,12 @@ export function useSoraWatermarkRemoval() {
         ...prev,
         isRemoving: false,
         progress: 100,
-        stageMessage: 'Done',
+        stageMessage: residualPassed ? 'Done' : 'Partial removal — review preview',
         processedVideoUrl: url,
         processedMimeType: mimeType,
+        processedBlob: blob,
+        residualPassed,
+        residualFraction,
       }));
     } catch (err: any) {
       if (ac.signal.aborted) return;

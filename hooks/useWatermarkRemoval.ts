@@ -10,6 +10,7 @@ export function useWatermarkRemoval() {
     progress: 0,
     error: null,
     processedVideoUrl: null,
+    processedBlob: null,
   });
 
   // AbortControllers rather than plain flags: a flag only stopped the hook
@@ -105,6 +106,7 @@ export function useWatermarkRemoval() {
           ...prev,
           isRemoving: false,
           processedVideoUrl: url,
+          processedBlob: blob,
           progress: 100,
         }));
       }
@@ -155,6 +157,7 @@ export function useWatermarkRemoval() {
       progress: 0,
       error: null,
       processedVideoUrl: null,
+      processedBlob: null,
     });
   }, []);
 

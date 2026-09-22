@@ -7,12 +7,27 @@ import { DEFAULT_VIDEO_SETTINGS } from '../constants';
 import DownloadIcon from './icons/DownloadIcon';
 import ProcessingSpinnerIcon from './icons/ProcessingSpinnerIcon';
 
-const WatermarkRemover: React.FC = () => {
-  const [videoFile, setVideoFile] = useState<File | null>(null);
+export interface WatermarkRemoverProps {
+  videoFile: File | null;
+  onVideoFileChange: (file: File) => void;
+  onClearVideo: () => void;
+  onUseInModifier?: (file: File) => void;
+  videoDuration?: number;
+  onVideoDuration?: (duration: number | undefined) => void;
+}
+
+const WatermarkRemover: React.FC<WatermarkRemoverProps> = ({
+  videoFile,
+  onVideoFileChange,
+  onClearVideo,
+  onUseInModifier,
+  videoDuration,
+  onVideoDuration,
+}) => {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
   const [fileError, setFileError] = useState<string | null>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
+  const lastFileKeyRef = useRef<string | null>(null);
 
   const {
     detectWatermark,
@@ -23,18 +38,15 @@ const WatermarkRemover: React.FC = () => {
     state,
   } = useWatermarkRemoval();
 
-  // Handle file selection
   const handleFileSelect = (file: File) => {
-    setVideoFile(file);
     setFileError(null);
-    reset();
-    
-    // Get video duration
+    onVideoFileChange(file);
+
     const video = document.createElement('video');
     video.preload = 'metadata';
     video.onloadedmetadata = () => {
       if (isFinite(video.duration)) {
-        setVideoDuration(video.duration);
+        onVideoDuration?.(video.duration);
       }
       URL.revokeObjectURL(video.src);
     };
@@ -43,16 +55,14 @@ const WatermarkRemover: React.FC = () => {
 
   const handleFileError = (error: string) => {
     setFileError(error);
-    setVideoFile(null);
     reset();
+    onClearVideo();
   };
 
-  // Create preview URL for original video
   useEffect(() => {
     if (videoFile) {
       const objectUrl = URL.createObjectURL(videoFile);
       setPreviewUrl(objectUrl);
-      
       return () => {
         URL.revokeObjectURL(objectUrl);
       };
@@ -61,10 +71,18 @@ const WatermarkRemover: React.FC = () => {
     }
   }, [videoFile]);
 
+  useEffect(() => {
+    const key = videoFile ? `${videoFile.name}:${videoFile.size}:${videoFile.lastModified}` : null;
+    if (key !== lastFileKeyRef.current) {
+      lastFileKeyRef.current = key;
+      reset();
+    }
+  }, [videoFile, reset]);
+
   const handleUploadDifferent = () => {
-    setVideoFile(null);
     reset();
     setFileError(null);
+    onClearVideo();
   };
 
   const handleDetectWatermark = async () => {
@@ -79,7 +97,17 @@ const WatermarkRemover: React.FC = () => {
     }
   };
 
-  // Calculate overlay position for detected watermark
+  const handleUseInModifier = () => {
+    if (!state.processedBlob || !onUseInModifier) return;
+    const base = videoFile?.name.replace(/\.[^.]+$/, '') || 'video';
+    const file = new File(
+      [state.processedBlob],
+      `watermark_removed_${base}.webm`,
+      { type: state.processedBlob.type || 'video/webm' }
+    );
+    onUseInModifier(file);
+  };
+
   const getWatermarkOverlayStyle = () => {
     if (!state.detectionResult?.coords || !videoContainerRef.current) {
       return null;
@@ -91,12 +119,12 @@ const WatermarkRemover: React.FC = () => {
 
     const containerRect = container.getBoundingClientRect();
     const videoRect = video.getBoundingClientRect();
-    
+
     const scaleX = videoRect.width / video.videoWidth;
     const scaleY = videoRect.height / video.videoHeight;
-    
+
     const coords = state.detectionResult.coords;
-    
+
     return {
       position: 'absolute' as const,
       left: `${videoRect.left - containerRect.left + coords.x * scaleX}px`,
@@ -258,7 +286,7 @@ const WatermarkRemover: React.FC = () => {
             )}
 
             {state.processedVideoUrl && !state.isRemoving && (
-              <div className="bg-green-700 p-4 rounded-lg">
+              <div className="bg-green-700 p-4 rounded-lg space-y-3">
                 <h4 className="text-lg font-semibold text-green-100 mb-2">Watermark Removed!</h4>
                 <p className="text-sm text-green-200 mb-3">Your processed video is ready (WEBM format).</p>
                 <a
@@ -269,6 +297,15 @@ const WatermarkRemover: React.FC = () => {
                   <DownloadIcon className="w-5 h-5 mr-2" />
                   Download Processed Video
                 </a>
+                {onUseInModifier && state.processedBlob && (
+                  <button
+                    type="button"
+                    onClick={handleUseInModifier}
+                    className="w-full px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200"
+                  >
+                    Use in Modifier
+                  </button>
+                )}
               </div>
             )}
 

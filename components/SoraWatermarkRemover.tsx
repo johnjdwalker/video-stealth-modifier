@@ -7,9 +7,9 @@ import { useSoraWatermarkRemoval } from '../hooks/useSoraWatermarkRemoval';
 import { SoraRemovalQuality, WatermarkCoords } from '../types';
 
 const QUALITY_OPTIONS: Array<{ value: SoraRemovalQuality; label: string; description: string }> = [
-  { value: 'fast',     label: 'Fast',     description: '4 reference frames. Quickest, less robust on busy backgrounds.' },
-  { value: 'balanced', label: 'Balanced', description: '8 reference frames. Best speed-quality trade-off.' },
-  { value: 'high',     label: 'High',     description: '14 reference frames. Cleanest fill on dynamic scenes (slower).' },
+  { value: 'fast',     label: 'Fast',     description: '6 reference frames. Quickest, less robust on busy backgrounds.' },
+  { value: 'balanced', label: 'Balanced', description: '10 reference frames. Best speed-quality trade-off.' },
+  { value: 'high',     label: 'High',     description: '16 reference frames. Cleanest fill on dynamic scenes (slower).' },
 ];
 
 interface PlaybackBoxProps {
@@ -105,10 +105,24 @@ const PlaybackWithOverlay: React.FC<PlaybackBoxProps> = ({
   );
 };
 
-const SoraWatermarkRemover: React.FC = () => {
-  const [videoFile, setVideoFile] = useState<File | null>(null);
+export interface SoraWatermarkRemoverProps {
+  videoFile: File | null;
+  onVideoFileChange: (file: File) => void;
+  onClearVideo: () => void;
+  onUseInModifier?: (file: File) => void;
+  videoDuration?: number;
+  onVideoDuration?: (duration: number | undefined) => void;
+}
+
+const SoraWatermarkRemover: React.FC<SoraWatermarkRemoverProps> = ({
+  videoFile,
+  onVideoFileChange,
+  onClearVideo,
+  onUseInModifier,
+  videoDuration,
+  onVideoDuration,
+}) => {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
   const [fileError, setFileError] = useState<string | null>(null);
   const [quality, setQuality] = useState<SoraRemovalQuality>('balanced');
   const [manualMode, setManualMode] = useState(false);
@@ -117,6 +131,7 @@ const SoraWatermarkRemover: React.FC = () => {
   });
 
   const { state, detect, remove, cancelDetection, cancelRemoval, reset } = useSoraWatermarkRemoval();
+  const lastFileKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!videoFile) { setPreviewUrl(null); return; }
@@ -125,17 +140,23 @@ const SoraWatermarkRemover: React.FC = () => {
     return () => URL.revokeObjectURL(url);
   }, [videoFile]);
 
+  // Reset removal state when the shared file identity changes.
+  useEffect(() => {
+    const key = videoFile ? `${videoFile.name}:${videoFile.size}:${videoFile.lastModified}` : null;
+    if (key !== lastFileKeyRef.current) {
+      lastFileKeyRef.current = key;
+      reset();
+    }
+  }, [videoFile, reset]);
+
   const handleFileSelect = (file: File) => {
-    setVideoFile(file);
     setFileError(null);
-    setVideoDuration(undefined);
-    reset();
+    onVideoFileChange(file);
 
     const probe = document.createElement('video');
     probe.preload = 'metadata';
     probe.onloadedmetadata = () => {
-      if (isFinite(probe.duration)) setVideoDuration(probe.duration);
-      // Seed manual region to a corner-ish default sized to the video.
+      if (isFinite(probe.duration)) onVideoDuration?.(probe.duration);
       if (probe.videoWidth && probe.videoHeight) {
         const w = Math.round(probe.videoWidth * 0.12);
         const h = Math.round(probe.videoHeight * 0.06);
@@ -148,14 +169,14 @@ const SoraWatermarkRemover: React.FC = () => {
 
   const handleFileError = (error: string) => {
     setFileError(error);
-    setVideoFile(null);
+    onClearVideo();
     reset();
   };
 
   const handleUploadDifferent = () => {
-    setVideoFile(null);
     setFileError(null);
     reset();
+    onClearVideo();
   };
 
   const handleDetect = () => {
@@ -168,6 +189,18 @@ const SoraWatermarkRemover: React.FC = () => {
     remove(videoFile, quality);
   };
 
+  const handleUseInModifier = () => {
+    if (!state.processedBlob || !onUseInModifier) return;
+    const ext = state.processedMimeType?.includes('mp4') ? 'mp4' : 'webm';
+    const base = videoFile?.name.replace(/\.[^.]+$/, '') || 'video';
+    const file = new File(
+      [state.processedBlob],
+      `sora_clean_${base}.${ext}`,
+      { type: state.processedMimeType || 'video/webm' }
+    );
+    onUseInModifier(file);
+  };
+
   const detection = state.detection;
   const downloadName = useMemo(() => {
     const base = videoFile?.name.replace(/\.[^.]+$/, '') || 'video';
@@ -176,6 +209,8 @@ const SoraWatermarkRemover: React.FC = () => {
   }, [videoFile, state.processedMimeType]);
 
   const busy = state.isDetecting || state.isRemoving;
+  const residualPassed = state.residualPassed === true;
+  const residualFailed = state.residualPassed === false;
 
   return (
     <div className="w-full space-y-6">
@@ -196,8 +231,8 @@ const SoraWatermarkRemover: React.FC = () => {
             <p className="font-semibold text-gray-100 mb-2">What this does</p>
             <ul className="list-disc ml-5 space-y-1 text-gray-400">
               <li>Targets the bouncing white logo from <span className="text-white">Sora 2 / ChatGPT video</span> (and similar moving overlays).</li>
-              <li>Tracks the watermark across the whole clip, then reconstructs each covered pixel from another moment in the video where the watermark wasn't there.</li>
-              <li>Edges of the patched region are feathered for seamless blending.</li>
+              <li>Tracks the watermark across the whole clip, then reconstructs each covered pixel from another moment in the video where the watermark was not there.</li>
+              <li>Per-frame masks limit fill to the logo+text pixels (feathered) to avoid ghosting on cuts.</li>
               <li>Works entirely in your browser — no upload, no server.</li>
             </ul>
           </div>
@@ -217,7 +252,9 @@ const SoraWatermarkRemover: React.FC = () => {
             </div>
             <div>
               <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">
-                {state.processedVideoUrl ? 'Watermark Removed' : 'Result'}
+                {state.processedVideoUrl
+                  ? (residualPassed ? 'Watermark Removed' : residualFailed ? 'Partial Removal' : 'Result')
+                  : 'Result'}
               </h4>
               <PlaybackWithOverlay videoSrc={state.processedVideoUrl ?? previewUrl} />
             </div>
@@ -230,7 +267,6 @@ const SoraWatermarkRemover: React.FC = () => {
             duration={videoDuration}
           />
 
-          {/* Detection controls */}
           <div className="bg-gray-800 p-6 rounded-lg shadow-lg space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h3 className="text-xl font-semibold text-gray-100">Sora Watermark Removal</h3>
@@ -315,7 +351,6 @@ const SoraWatermarkRemover: React.FC = () => {
               </div>
             )}
 
-            {/* Quality + run */}
             {detection?.detected && (
               <div className="space-y-3 pt-3 border-t border-gray-700">
                 <div>
@@ -374,19 +409,38 @@ const SoraWatermarkRemover: React.FC = () => {
             )}
 
             {state.processedVideoUrl && !state.isRemoving && (
-              <div className="bg-emerald-700 p-4 rounded-lg">
-                <h4 className="text-lg font-semibold text-emerald-100 mb-2">Watermark removed!</h4>
-                <p className="text-sm text-emerald-200 mb-3">
-                  Your processed video is ready ({state.processedMimeType?.includes('mp4') ? 'MP4' : 'WEBM'}).
+              <div className={`p-4 rounded-lg ${residualPassed ? 'bg-emerald-700' : 'bg-amber-800 border border-amber-500'}`}>
+                <h4 className={`text-lg font-semibold mb-2 ${residualPassed ? 'text-emerald-100' : 'text-amber-100'}`}>
+                  {residualPassed ? 'Watermark removed!' : 'Partial removal — review preview'}
+                </h4>
+                <p className={`text-sm mb-3 ${residualPassed ? 'text-emerald-200' : 'text-amber-100'}`}>
+                  {residualPassed
+                    ? `Your processed video is ready (${state.processedMimeType?.includes('mp4') ? 'MP4' : 'WEBM'}). Residual check passed.`
+                    : `Bright translucent pixels remain in the watermark region (~${Math.round((state.residualFraction ?? 0) * 1000) / 10}% of ROI). Download and review, or try High quality / Manual region.`}
                 </p>
-                <a
-                  href={state.processedVideoUrl}
-                  download={downloadName}
-                  className="w-full px-6 py-3 bg-emerald-500 hover:bg-emerald-600 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200"
-                >
-                  <DownloadIcon className="w-5 h-5 mr-2" />
-                  Download Clean Video
-                </a>
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <a
+                    href={state.processedVideoUrl}
+                    download={downloadName}
+                    className={`flex-1 px-6 py-3 font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200 text-white ${
+                      residualPassed
+                        ? 'bg-emerald-500 hover:bg-emerald-600'
+                        : 'bg-amber-600 hover:bg-amber-500'
+                    }`}
+                  >
+                    <DownloadIcon className="w-5 h-5 mr-2" />
+                    Download Clean Video
+                  </a>
+                  {onUseInModifier && state.processedBlob && (
+                    <button
+                      type="button"
+                      onClick={handleUseInModifier}
+                      className="flex-1 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-md transition-colors duration-200"
+                    >
+                      Use in Modifier
+                    </button>
+                  )}
+                </div>
               </div>
             )}
 
