@@ -18,14 +18,15 @@ import {
 //      every covered pixel.
 // ----------------------------------------------------------------------------
 
-const DETECTION_TARGET_SAMPLES = 110;       // denser — Sora logo teleports between corners
-const DETECTION_MAX_SAMPLE_INTERVAL = 0.28; // seconds; clamps very long videos
-const DETECTION_MIN_SAMPLE_INTERVAL = 0.05; // seconds; clamps very short videos
+const DETECTION_TARGET_SAMPLES = 160;       // denser (forensic FPS 5/10/24) — catch corner hops
+const DETECTION_MAX_SAMPLE_INTERVAL = 0.20; // seconds; clamps very long videos
+const DETECTION_MIN_SAMPLE_INTERVAL = 0.04; // seconds; clamps very short videos
 
 // Luminance threshold (0-255). Pixels brighter than this are watermark candidates.
-const BRIGHT_THRESHOLD = 200;
+// Forensic: mark opacity "breathes" ~0.35–0.70 at 0.2–0.5Hz — do NOT require peak white.
+const BRIGHT_THRESHOLD = 175;
 // Saturation threshold (0-255 max-min). Below this is "white-ish".
-const LOW_SATURATION_THRESHOLD = 60;
+const LOW_SATURATION_THRESHOLD = 70;
 // Working resolution for detection (downscaled). Higher = more accurate logos/text.
 const DETECTION_WORK_WIDTH = 640;
 
@@ -34,7 +35,10 @@ const DETECTION_WORK_WIDTH = 640;
 const MIN_WATERMARK_FRAC = 0.015;
 // Hard cap: reject huge sky/asphalt/face blobs that drown the small logo+text strip.
 const MAX_WATERMARK_FRAC = 0.16;
-const MAX_WATERMARK_HEIGHT_FRAC = 0.14;
+const MAX_WATERMARK_HEIGHT_FRAC = 0.08;
+// Forensic aspect/size anchor: mark height ≈ 3.5% of frame height; width = logo+text strip.
+const MARK_HEIGHT_FRAC = 0.035;
+const MARK_HEIGHT_TOL = 0.55; // accept ~0.015–0.055 of frame height
 
 // Sora logo+text strip aspect prior (width/height). Typical strip is wide.
 const ASPECT_PRIOR_MIN = 1.4;
@@ -45,7 +49,8 @@ const ASPECT_PRIOR_SOFT_MAX = 9.0;
 // Reference frame counts per quality level. More references = better fill, more memory.
 const REFERENCE_FRAME_COUNTS: Record<SoraRemovalQuality, number> = {
   fast: 12,
-  balanced: 22,
+  // Balanced borrows High refs until opaque cover is proven on acceptance clips.
+  balanced: 32,
   high: 32,
 };
 
@@ -64,14 +69,22 @@ const DEFAULT_PADDING_X_EXTRA = 48;
 // Extra vertical padding — handle line sits below "Sora".
 const DEFAULT_PADDING_Y_EXTRA = 18;
 // Asymmetric text-side pad: cloud logo is left; "Sora" + "@handle" extend right + down.
-const TEXT_SIDE_PAD_EXTRA = 56;
-const HANDLE_LINE_PAD_EXTRA = 22;
+const TEXT_SIDE_PAD_EXTRA = 96;
+const HANDLE_LINE_PAD_EXTRA = 36;
+/** Set true (or window.__SORA_WM_DEBUG = true) for per-second slot/bbox logs. */
+const SORA_WM_DEBUG_DEFAULT = false;
+// Forensic: within a corner dwell the mark micro-drifts ~1.5–4px sinusoidally.
+// Expand search/fill pad so ROI doesn't trail the sub-pixel wobble.
+const CORNER_DRIFT_PAD_PX = 8;
+// Extra opaque-cover inset beyond padded bbox (catches AA / breathing edges).
+const OPAQUE_COVER_EXTRA_PX = 6;
 // Morphological close radius (work-res) before connected components — merges glyph strokes.
 const DETECT_CLOSE_PX = 5;
 // (Trajectory is piecewise-constant across slot hops; no spatial lerp.)
 // Per-frame snap: search pad around predicted bbox (full-res px).
-const SNAP_SEARCH_PAD = 140;
-const SNAP_MIN_SCORE = 0.34;
+// Include corner micro-drift so local snap doesn't miss a 1.5–4px wobble.
+const SNAP_SEARCH_PAD = 140 + CORNER_DRIFT_PAD_PX * 2;
+const SNAP_MIN_SCORE = 0.30; // slightly softer — opacity breathing dims the mark
 
 // ---------------------------------------------------------------------------
 // 9-slot dwell prior (Sora hops between edge/corner cells; multi-second holds).
@@ -86,10 +99,13 @@ const SLOT_EDGE_WEIGHT: Record<SlotId, number> = {
   ML: 0.78, C: 0.35, MR: 0.78,
   BL: 1.00, BC: 0.78, BR: 1.00,
 };
-/** Hysteresis: new slot must beat current by this margin to switch. */
+/** Hysteresis: new slot must beat current by this margin to switch (detection only). */
 const SLOT_SWITCH_MARGIN = 0.08;
-/** Stickiness bonus for remaining in the previous slot. */
+/** Stickiness bonus for remaining in the previous slot (detection only). */
 const SLOT_STICK_BONUS = 0.12;
+/** Removal uses near-zero stick so hops track the mark within a frame. */
+const SLOT_SWITCH_MARGIN_REMOVAL = 0.02;
+const SLOT_STICK_BONUS_REMOVAL = 0.0;
 
 // How many clean donor frames to blend for each patch (edge-aware multi-ref).
 const MULTI_REF_BLEND = 5;
@@ -102,7 +118,8 @@ const SURROUND_RADIUS = 9;
 // After first fill, if ROI bright fraction still exceeds this → nuclear box fill.
 const NUCLEAR_BRIGHT_FRAC = 0.04;
 // Outer ring (px) feathered during nuclear cover — hard core inside is alpha 1.0.
-const NUCLEAR_EDGE_FEATHER = 12;
+// Keep tiny: large feather left ~40% readable glyphs near ROI edges.
+const NUCLEAR_EDGE_FEATHER = 4;
 // Second nuclear pass if residual bright fraction still above this.
 const NUCLEAR_SECOND_PASS_FRAC = 0.012;
 
@@ -419,6 +436,7 @@ export async function removeSoraWatermark(
     let snapCount = 0;
     let lastSlotId: SlotId | null = null;
     let nuclearAppliedTotal = 0;
+    let lastDebugSec = -1;
     const drawFrame = () => {
       if (signal?.aborted) {
         try { mediaRecorder?.stop(); } catch { /* ignore */ }
@@ -428,45 +446,91 @@ export async function removeSoraWatermark(
         try { mediaRecorder?.stop(); } catch { /* ignore */ }
         return;
       }
-      // Base layer from the live video, then patchRegion overwrites the ROI with
-      // the filled composite. captureStream records this canvas after putImageData.
+      // Base layer from live video FIRST, then opaque cover(s) via putImageData.
+      // captureStream records this canvas only after fills land — never leave
+      // the raw video as the top layer under the recorder.
       ctx.drawImage(video, 0, 0, W, H);
 
       const t = video.currentTime;
       const predicted = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
 
-      // Per-frame 9-slot dwell re-score: hold on edge/corner until evidence hops.
-      let bbox = predicted;
+      // Per-output-frame re-detect across all 9 slots (no stickiness). Forensic
+      // hop path is piecewise dwells (TL→BR→MR→BL) with micro-drift inside slot.
+      const coverBoxes: WatermarkCoords[] = [];
       let localized = false;
+      let debugSlot: SlotId | null = null;
       try {
         const frame = ctx.getImageData(0, 0, W, H);
-        const pick = pickBestSlot(frame, W, H, lastSlotId);
-        if (pick && pick.score >= SNAP_MIN_SCORE) {
-          bbox = padBox(pick.bbox, detection.padding, W, H);
-          lastSlotId = pick.slot;
+        const strong = collectStrongSlotPicks(frame, W, H, SNAP_MIN_SCORE * 0.85);
+        if (strong.length > 0) {
           localized = true;
           snapCount++;
+          lastSlotId = strong[0].slot;
+          debugSlot = strong[0].slot;
+          // Cover best hit + any near-best neighbors (hop transitions / dual ghosts).
+          const top = strong[0].score;
+          for (const p of strong) {
+            if (p.score < top * 0.72 && coverBoxes.length >= 1) break;
+            coverBoxes.push(expandBoxForDrift(padBox(p.bbox, detection.padding, W, H), W, H));
+            if (coverBoxes.length >= 3) break;
+          }
+        } else {
+          // Fall back: sticky-free best slot, then local snap around trajectory.
+          const pick = pickBestSlot(frame, W, H, null, { sticky: false });
+          if (pick && pick.score >= SNAP_MIN_SCORE * 0.75) {
+            coverBoxes.push(expandBoxForDrift(padBox(pick.bbox, detection.padding, W, H), W, H));
+            lastSlotId = pick.slot;
+            debugSlot = pick.slot;
+            localized = true;
+            snapCount++;
+          }
         }
-      } catch { /* getImageData can throw on tainted canvas — fall through */ }
-      if (!localized) {
+      } catch { /* tainted canvas — fall through */ }
+
+      if (coverBoxes.length === 0) {
         const snap = snapBboxToLocalBright(ctx, predicted, W, H, detection.padding);
-        bbox = snap.bbox;
+        coverBoxes.push(expandBoxForDrift(snap.bbox, W, H));
         if (snap.snapped) {
           snapCount++;
           localized = true;
           lastSlotId = slotIdOfPoint(
-            bbox.x + bbox.width / 2, bbox.y + bbox.height / 2, W, H
+            snap.bbox.x + snap.bbox.width / 2, snap.bbox.y + snap.bbox.height / 2, W, H
+          );
+          debugSlot = lastSlotId;
+        }
+      } else {
+        // Also cover predicted slot during hop windows so lag can't leave glyphs.
+        const predExp = expandBoxForDrift(predicted, W, H);
+        if (!boxesOverlap(predExp, coverBoxes[0])) {
+          coverBoxes.push(predExp);
+        }
+      }
+
+      let nuclearApplied = false;
+      for (const bbox of coverBoxes) {
+        if (patchRegion(ctx, maskCtx, maskCanvas, references, t, bbox, W, H, quality)) {
+          nuclearApplied = true;
+        }
+      }
+      if (nuclearApplied) nuclearAppliedTotal++;
+
+      if (isSoraWmDebug()) {
+        const sec = Math.floor(t);
+        if (sec !== lastDebugSec) {
+          lastDebugSec = sec;
+          const b = coverBoxes[0];
+          console.log(
+            `[sora-wm] t=${t.toFixed(2)}s slot=${debugSlot ?? lastSlotId ?? '?'} ` +
+            `boxes=${coverBoxes.length} bbox=${b ? `${b.x},${b.y} ${b.width}x${b.height}` : 'none'} ` +
+            `nuclearTotal=${nuclearAppliedTotal}`
           );
         }
       }
 
-      const nuclearApplied = patchRegion(ctx, maskCtx, maskCanvas, references, t, bbox, W, H, quality);
-      if (nuclearApplied) nuclearAppliedTotal++;
-
       if (duration > 0) {
         const pct = 25 + (t / duration) * 75;
         const note = localized
-          ? `Reconstructing frames (slot=${lastSlotId ?? '?'}, nuclearApplied=${nuclearAppliedTotal})`
+          ? `Reconstructing frames (slot=${debugSlot ?? lastSlotId ?? '?'}, covers=${coverBoxes.length}, nuclearApplied=${nuclearAppliedTotal})`
           : `Reconstructing frames (hold predict, nuclearApplied=${nuclearAppliedTotal})`;
         onProgress?.(Math.min(99.9, pct), note);
       }
@@ -812,12 +876,16 @@ function pickBestSlot(
   imageData: ImageData,
   W: number,
   H: number,
-  prevSlot: SlotId | null
+  prevSlot: SlotId | null,
+  opts: { sticky?: boolean } = {}
 ): SlotPick | null {
+  const sticky = opts.sticky !== false; // default sticky for detection trajectory
+  const stickBonus = sticky ? SLOT_STICK_BONUS : SLOT_STICK_BONUS_REMOVAL;
+  const switchMargin = sticky ? SLOT_SWITCH_MARGIN : SLOT_SWITCH_MARGIN_REMOVAL;
+
   let best: SlotPick | null = null;
   for (const id of SLOT_IDS) {
     const rect = slotRect(id, W, H);
-    // Extract slot crop into a temporary ImageData for the cluster finder.
     const crop = new ImageData(rect.width, rect.height);
     const src = imageData.data;
     const dst = crop.data;
@@ -831,9 +899,6 @@ function pickBestSlot(
     }
     const hit = findBrightTranslucentCluster(crop, rect.width, rect.height, null);
     if (!hit) continue;
-    // Normalize confidence to 0..1 and apply edge prior + stickiness.
-    // Eye-pair signature on the full-frame crop strongly prefers real Sora logo.
-    // Expand horizontally — cloud icon often CC-separates from "Sora"/@handle.
     const ex = Math.max(6, Math.round(hit.bbox.width * 0.55));
     const eyeBox = {
       x: Math.max(0, rect.x + hit.bbox.x - ex),
@@ -843,8 +908,8 @@ function pickBestSlot(
     };
     const eye = soraIconEyeBonus(src, W, eyeBox);
     let score = (hit.confidence / 100) * SLOT_EDGE_WEIGHT[id] * (0.55 + 0.45 * Math.max(eye, 0.15));
-    score += eye * 0.55; // decisive: cloud-eyes beat sky/asphalt blobs
-    if (prevSlot === id) score += SLOT_STICK_BONUS;
+    score += eye * 0.55;
+    if (prevSlot === id) score += stickBonus;
     if (!best || score > best.score) {
       best = {
         slot: id,
@@ -860,10 +925,10 @@ function pickBestSlot(
     }
   }
   if (!best) return null;
-  // Hysteresis: keep previous slot unless challenger beats it by margin.
-  // Exception: if challenger has strong cloud-eye evidence and prev does not,
-  // allow the hop (Sora teleports to a new corner/edge).
-  if (prevSlot && best.slot !== prevSlot) {
+
+  // Sticky hysteresis only when requested (detection). Removal passes sticky:false
+  // so hops track TL→BR→MR→BL within a frame instead of trailing by seconds.
+  if (sticky && prevSlot && best.slot !== prevSlot) {
     const prevRect = slotRect(prevSlot, W, H);
     const crop = new ImageData(prevRect.width, prevRect.height);
     const src = imageData.data;
@@ -889,11 +954,11 @@ function pickBestSlot(
       const prevScore =
         (prevHit.confidence / 100) * SLOT_EDGE_WEIGHT[prevSlot] * (0.55 + 0.45 * Math.max(prevEye, 0.15))
         + prevEye * 0.55
-        + SLOT_STICK_BONUS;
-      const challengerHasEyes = best.score > 0.9; // eye-boosted scores land higher
+        + stickBonus;
+      const challengerHasEyes = best.score > 0.9;
       const prevLostEyes = prevEye < 0.3;
       const allowHop = challengerHasEyes && prevLostEyes;
-      if (!allowHop && best.score < prevScore + SLOT_SWITCH_MARGIN) {
+      if (!allowHop && best.score < prevScore + switchMargin) {
         return {
           slot: prevSlot,
           bbox: {
@@ -911,8 +976,66 @@ function pickBestSlot(
   return best;
 }
 
+/**
+ * Score all 9 slots and return every pick above minScore (sorted best-first).
+ * Used during removal so we can opaque-cover the live mark even if a stale
+ * trajectory slot still scores.
+ */
+function collectStrongSlotPicks(
+  imageData: ImageData,
+  W: number,
+  H: number,
+  minScore: number
+): SlotPick[] {
+  // Direct per-slot scoring (no hysteresis):
+  const out: SlotPick[] = [];
+  for (const id of SLOT_IDS) {
+    const rect = slotRect(id, W, H);
+    const crop = new ImageData(rect.width, rect.height);
+    const src = imageData.data;
+    const dst = crop.data;
+    for (let y = 0; y < rect.height; y++) {
+      for (let x = 0; x < rect.width; x++) {
+        const si = ((rect.y + y) * W + (rect.x + x)) * 4;
+        const di = (y * rect.width + x) * 4;
+        dst[di] = src[si]; dst[di + 1] = src[si + 1];
+        dst[di + 2] = src[si + 2]; dst[di + 3] = src[si + 3];
+      }
+    }
+    const hit = findBrightTranslucentCluster(crop, rect.width, rect.height, null);
+    if (!hit) continue;
+    const ex = Math.max(6, Math.round(hit.bbox.width * 0.55));
+    const eyeBox = {
+      x: Math.max(0, rect.x + hit.bbox.x - ex),
+      y: Math.max(0, rect.y + hit.bbox.y - 2),
+      width: Math.min(W - Math.max(0, rect.x + hit.bbox.x - ex), hit.bbox.width + ex * 2),
+      height: Math.min(H - Math.max(0, rect.y + hit.bbox.y - 2), hit.bbox.height + 4),
+    };
+    const eye = soraIconEyeBonus(src, W, eyeBox);
+    // Require some eye evidence OR strong edge strip — reject face/vest glare.
+    if (eye < 0.15 && SLOT_EDGE_WEIGHT[id] < 0.9) continue;
+    let score = (hit.confidence / 100) * SLOT_EDGE_WEIGHT[id] * (0.55 + 0.45 * Math.max(eye, 0.15));
+    score += eye * 0.55;
+    if (score < minScore) continue;
+    out.push({
+      slot: id,
+      bbox: {
+        x: rect.x + hit.bbox.x,
+        y: rect.y + hit.bbox.y,
+        width: hit.bbox.width,
+        height: hit.bbox.height,
+      },
+      score,
+      confidence: hit.confidence,
+    });
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
 
 /**
+
+
  * Sora's cloud logo has two dark "eye" ovals inside a bright blob. Sky/asphalt
  * bright clusters lack this signature. Returns 0..1 bonus.
  */
@@ -1071,8 +1194,9 @@ function findBrightTranslucentCluster(
   // 3. Score: prefer mid-density wide strips of watermark size near edges.
   // Solid bright blobs (sky, specular asphalt, vest glare) score poorly.
   let best: { score: number; bbox: WatermarkCoords; confidence: number } | null = null;
-  const idealW = longSide * 0.12;
-  const idealH = longSide * 0.055;
+  // Forensic: mark height ≈ 3.5% of *frame height* (not long-side); width is logo+text strip.
+  const idealH = H * MARK_HEIGHT_FRAC;
+  const idealW = idealH * 3.2; // logo + "Sora" + @handle strip
   for (const c of candidates) {
     const area = c.bbox.width * c.bbox.height;
     const density = c.pixelCount / area;
@@ -1105,11 +1229,16 @@ function findBrightTranslucentCluster(
     else if (density < 0.08) densBonus = clamp(density / 0.08, 0, 1) * 0.35;
     else densBonus = 0.15; // very solid
 
-    // Size prior around typical logo+handle footprint.
+    // Size prior: height must sit near 3.5% of frame (reject sky blobs / noise).
+    const heightFrac = c.bbox.height / Math.max(1, H);
+    const heightDev = Math.abs(heightFrac - MARK_HEIGHT_FRAC) / MARK_HEIGHT_FRAC;
+    if (heightDev > MARK_HEIGHT_TOL * 2.2) continue; // absurd vs forensic anchor
     const sizeErr =
       Math.abs(c.bbox.width - idealW) / idealW +
       Math.abs(c.bbox.height - idealH) / idealH;
-    const sizeBonus = clamp(1 - sizeErr * 0.55, 0, 1);
+    let sizeBonus = clamp(1 - sizeErr * 0.55, 0, 1);
+    // Extra reward when height matches ~3.5% frame height.
+    sizeBonus = clamp(sizeBonus * (1.15 - clamp(heightDev / MARK_HEIGHT_TOL, 0, 1) * 0.55), 0, 1);
 
     const score =
       densBonus * 0.22 +
@@ -1249,6 +1378,23 @@ function padBox(b: WatermarkCoords, padding: number, W: number, H: number): Wate
 function boxesOverlap(a: WatermarkCoords, b: WatermarkCoords): boolean {
   return !(a.x + a.width <= b.x || b.x + b.width <= a.x ||
            a.y + a.height <= b.y || b.y + b.height <= a.y);
+}
+
+/** Expand ROI by forensic corner-drift + opaque-cover pad (≥6–8px). */
+function expandBoxForDrift(b: WatermarkCoords, W: number, H: number): WatermarkCoords {
+  const pad = CORNER_DRIFT_PAD_PX + OPAQUE_COVER_EXTRA_PX;
+  const x = clamp(Math.round(b.x - pad), 0, W - 1);
+  const y = clamp(Math.round(b.y - pad), 0, H - 1);
+  const width = clamp(Math.round(b.width + pad * 2), 1, W - x);
+  const height = clamp(Math.round(b.height + pad * 2), 1, H - y);
+  return { x, y, width, height };
+}
+
+function isSoraWmDebug(): boolean {
+  try {
+    if (typeof window !== 'undefined' && (window as any).__SORA_WM_DEBUG === true) return true;
+  } catch { /* ignore */ }
+  return SORA_WM_DEBUG_DEFAULT;
 }
 
 type RefFrame = { time: number; canvas: HTMLCanvasElement; bbox: WatermarkCoords };
@@ -1815,7 +1961,7 @@ function patchRegion(
     : quality === 'balanced' ? MULTI_REF_BLEND + 1
     : MULTI_REF_BLEND;
   const refs = pickReferencesForBox(references, currentTime, bbox, blendCount);
-  if (refs.length === 0) return false;
+  // Continue even with zero refs — border-mean opaque cover still kills glyphs.
 
   const bw = bbox.width;
   const bh = bbox.height;
@@ -1836,7 +1982,8 @@ function patchRegion(
   const { hitCount, maskCoverage } = buildBrightMaskInRoi(roi, alpha, hardMask);
   // Always fill when strip prior covers the tracked ROI (even if bright hits
   // are sparse / zero — translucent text is often under the bright threshold).
-  if (hitCount === 0 && maskCoverage < 0.05) return false;
+  // Do not soft-abort: trajectory/slot ROI still gets forced opaque cover.
+  const sparseMask = hitCount === 0 && maskCoverage < 0.05;
 
   if (!patchScratch.refCanvas) {
     patchScratch.refCanvas = document.createElement('canvas');
@@ -1867,12 +2014,12 @@ function patchRegion(
     if (weight < 0.08 && donors.length > 0) continue;
     donors.push({ data: new Uint8ClampedArray(donor.data), weight });
   }
-  if (donors.length === 0) return false;
-
+  // Soft-fail removed: if no clean donors, still nuclear-cover with border mean.
   let wSum = 0;
   for (const d of donors) wSum += d.weight;
-  if (wSum <= 0) return false;
-  for (const d of donors) d.weight /= wSum;
+  if (wSum > 0) {
+    for (const d of donors) d.weight /= wSum;
+  }
 
   const surroundR = quality === 'fast' ? Math.max(5, SURROUND_RADIUS - 2) : SURROUND_RADIUS;
   const out = roi.data;
@@ -1930,30 +2077,27 @@ function patchRegion(
     : quality === 'fast'
       ? NUCLEAR_BRIGHT_FRAC * 1.35
       : NUCLEAR_BRIGHT_FRAC;
-  // Always nuclear on balanced/high — soft Telea alone leaves readable @handle text.
-  const forceNuclear =
-    residualFrac >= nuclearThresh ||
-    (hitCount >= 8 && residualFrac >= nuclearThresh * 0.45) ||
-    quality !== 'fast';
+  // Decisive: always force opaque nuclear cover on the localized ROI.
+  // Soft Telea alone left ~40% readable glyphs (opacity breathing + AA edges).
+  const forceNuclear = true;
+  void residualFrac; void nuclearThresh; void sparseMask;
   const border = borderMeanRgb(
     original, alpha, bw, bh,
     Math.max(3, Math.round(Math.min(bw, bh) * 0.1))
   );
-  if (forceNuclear) {
-    applyNuclearFill(out, donors, bw, bh, border, false);
-  }
-
-  // Pass (c): if residual bright cluster remains, opaque-cover those pixels only
-  // (plus a small dilate) so glyphs die without a hard full-ROI stamp.
-  if (forceNuclear) {
-    const afterFrac = brightFractionInRoi(roi);
-    const cluster = largestBrightClusterInRoi(roi);
-    const needsSecond =
-      afterFrac >= NUCLEAR_SECOND_PASS_FRAC ||
-      (cluster !== null && clusterMatchesLogoTextPrior(cluster));
-    if (needsSecond) {
-      applyResidualOpaqueKill(out, bw, bh, border);
-    }
+  // First pass: borderline-feathered nuclear (tiny feather). Prefer clean donors.
+  applyNuclearFill(out, donors, bw, bh, border, false);
+  // Second pass: fully opaque kill of any remaining bright/low-sat glyph pixels.
+  applyResidualOpaqueKill(out, bw, bh, border);
+  // Third pass: if cluster prior still matches, stamp opaque again (no feather).
+  const afterFrac = brightFractionInRoi(roi);
+  const cluster = largestBrightClusterInRoi(roi);
+  if (
+    afterFrac >= NUCLEAR_SECOND_PASS_FRAC ||
+    (cluster !== null && clusterMatchesLogoTextPrior(cluster))
+  ) {
+    applyNuclearFill(out, donors, bw, bh, border, true);
+    applyResidualOpaqueKill(out, bw, bh, border);
   }
 
   // Draw order: write the filled ROI back onto the recording canvas. MediaRecorder
