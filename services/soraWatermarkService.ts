@@ -95,10 +95,23 @@ const SLOT_IDS = ['TL','TC','TR','ML','C','MR','BL','BC','BR'] as const;
 type SlotId = typeof SLOT_IDS[number];
 /** Soft prior weight per slot (corners highest, center lowest). */
 const SLOT_EDGE_WEIGHT: Record<SlotId, number> = {
-  TL: 1.00, TC: 0.78, TR: 1.00,
-  ML: 0.78, C: 0.35, MR: 0.78,
-  BL: 1.00, BC: 0.78, BR: 1.00,
+  TL: 1.00, TC: 0.82, TR: 1.00,
+  ML: 0.82, C: 0.12, MR: 0.82,
+  BL: 1.00, BC: 0.82, BR: 1.00,
 };
+/** Search corners first, then mid-edges; center last (rarely hosts the mark). */
+const SLOT_SEARCH_ORDER: SlotId[] = [
+  'TL', 'TR', 'BL', 'BR', 'TC', 'ML', 'MR', 'BC', 'C',
+];
+// Removal-loop budget: full-res 9-slot + nuclear every RAF starves captureStream
+// (MediaRecorder emits audio-only / tiny WEBM). Detect infrequently at low res;
+// every painted frame still covers from lastKnownGood bbox.
+const REMOVAL_DETECT_INTERVAL_MS = 100;
+const REMOVAL_DETECT_WORK_WIDTH = 320;
+/** Live lock requires cloud-eye signature — brightness alone locks face/sky. */
+const REMOVAL_MIN_EYE = 0.28;
+const RECORD_VIDEO_BITRATE = 4_000_000;
+const RECORD_TIMESLICE_MS = 200;
 /** Hysteresis: new slot must beat current by this margin to switch (detection only). */
 const SLOT_SWITCH_MARGIN = 0.08;
 /** Stickiness bonus for remaining in the previous slot (detection only). */
@@ -413,7 +426,14 @@ export async function removeSoraWatermark(
     }
 
     const stream = canvas.captureStream(30);
-    const tracks: MediaStreamTrack[] = stream.getVideoTracks();
+    const videoTracks = stream.getVideoTracks();
+    if (videoTracks.length === 0) {
+      throw new Error('canvas.captureStream produced no video track.');
+    }
+    for (const vt of videoTracks) {
+      try { vt.enabled = true; } catch { /* ignore */ }
+    }
+    const tracks: MediaStreamTrack[] = [...videoTracks];
     if (audioTrack) tracks.push(audioTrack);
     const combinedStream = new MediaStream(tracks);
 
@@ -421,9 +441,13 @@ export async function removeSoraWatermark(
       || pickFirstSupported(['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']);
     if (!mime) throw new Error('No supported MediaRecorder MIME type for WEBM in this browser.');
 
-    mediaRecorder = new MediaRecorder(combinedStream, { mimeType: mime });
+    mediaRecorder = new MediaRecorder(combinedStream, {
+      mimeType: mime,
+      videoBitsPerSecond: RECORD_VIDEO_BITRATE,
+      audioBitsPerSecond: 128_000,
+    });
     const chunks: Blob[] = [];
-    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
 
     const recordingDone = new Promise<void>((resolve, reject) => {
       mediaRecorder!.onstop = () => resolve();
@@ -433,95 +457,154 @@ export async function removeSoraWatermark(
       };
     });
 
+    // Downscaled canvas for throttled slot scoring (never getImageData full-res in RAF).
+    const detectScale = Math.min(1, REMOVAL_DETECT_WORK_WIDTH / W);
+    const detectW = Math.max(64, Math.round(W * detectScale));
+    const detectH = Math.max(64, Math.round(H * detectScale));
+    const detectCanvas = document.createElement('canvas');
+    detectCanvas.width = detectW;
+    detectCanvas.height = detectH;
+    const detectCtx = detectCanvas.getContext('2d', { willReadFrequently: true, alpha: false });
+    if (!detectCtx) throw new Error('Could not allocate detect canvas.');
+
     let snapCount = 0;
     let lastSlotId: SlotId | null = null;
     let nuclearAppliedTotal = 0;
     let lastDebugSec = -1;
-    const drawFrame = () => {
-      if (signal?.aborted) {
-        try { mediaRecorder?.stop(); } catch { /* ignore */ }
-        return;
-      }
-      if (video.paused || video.ended) {
-        try { mediaRecorder?.stop(); } catch { /* ignore */ }
-        return;
-      }
-      // Base layer from live video FIRST, then opaque cover(s) via putImageData.
-      // captureStream records this canvas only after fills land — never leave
-      // the raw video as the top layer under the recorder.
-      ctx.drawImage(video, 0, 0, W, H);
+    let lastDetectMs = -Infinity;
+    // Live cover set: replaced on each detect tick (no stale TL after hop to MR).
+    let liveCoverBoxes: WatermarkCoords[] = [];
+    let liveLocalized = false;
 
-      const t = video.currentTime;
-      const predicted = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
+    const scaleBoxUp = (b: WatermarkCoords): WatermarkCoords => ({
+      x: Math.round(b.x / detectScale),
+      y: Math.round(b.y / detectScale),
+      width: Math.round(b.width / detectScale),
+      height: Math.round(b.height / detectScale),
+    });
 
-      // Per-output-frame re-detect across all 9 slots (no stickiness). Forensic
-      // hop path is piecewise dwells (TL→BR→MR→BL) with micro-drift inside slot.
-      const coverBoxes: WatermarkCoords[] = [];
-      let localized = false;
-      let debugSlot: SlotId | null = null;
+    const refreshLiveSlots = () => {
+      if (!detectCtx) return;
+      detectCtx.drawImage(canvas, 0, 0, detectW, detectH);
+      let frame: ImageData;
       try {
-        const frame = ctx.getImageData(0, 0, W, H);
-        const strong = collectStrongSlotPicks(frame, W, H, SNAP_MIN_SCORE * 0.85);
-        if (strong.length > 0) {
-          localized = true;
-          snapCount++;
-          lastSlotId = strong[0].slot;
-          debugSlot = strong[0].slot;
-          // Cover best hit + any near-best neighbors (hop transitions / dual ghosts).
-          const top = strong[0].score;
-          for (const p of strong) {
-            if (p.score < top * 0.72 && coverBoxes.length >= 1) break;
-            coverBoxes.push(expandBoxForDrift(padBox(p.bbox, detection.padding, W, H), W, H));
-            if (coverBoxes.length >= 3) break;
-          }
-        } else {
-          // Fall back: sticky-free best slot, then local snap around trajectory.
-          const pick = pickBestSlot(frame, W, H, null, { sticky: false });
-          if (pick && pick.score >= SNAP_MIN_SCORE * 0.75) {
-            coverBoxes.push(expandBoxForDrift(padBox(pick.bbox, detection.padding, W, H), W, H));
-            lastSlotId = pick.slot;
-            debugSlot = pick.slot;
-            localized = true;
-            snapCount++;
-          }
+        frame = detectCtx.getImageData(0, 0, detectW, detectH);
+      } catch {
+        return;
+      }
+      const strong = collectStrongSlotPicks(
+        frame, detectW, detectH, SNAP_MIN_SCORE * 0.85, { requireEyes: true }
+      );
+      const next: WatermarkCoords[] = [];
+      let debugSlot: SlotId | null = null;
+      if (strong.length > 0) {
+        liveLocalized = true;
+        snapCount++;
+        lastSlotId = strong[0].slot;
+        debugSlot = strong[0].slot;
+        const top = strong[0].score;
+        for (const p of strong) {
+          // Only near-best with real watermark signature (eyes already gated).
+          if (p.score < top * 0.78 && next.length >= 1) break;
+          const full = clampBox(scaleBoxUp(p.bbox), W, H);
+          next.push(expandBoxForDrift(padBox(full, detection.padding, W, H), W, H));
+          if (next.length >= 2) break;
         }
-      } catch { /* tainted canvas — fall through */ }
+      } else {
+        const pick = pickBestSlot(frame, detectW, detectH, null, {
+          sticky: false,
+          requireEyes: true,
+        });
+        if (pick && pick.score >= SNAP_MIN_SCORE * 0.75 && pick.eye >= REMOVAL_MIN_EYE * 0.85) {
+          const full = clampBox(scaleBoxUp(pick.bbox), W, H);
+          next.push(expandBoxForDrift(padBox(full, detection.padding, W, H), W, H));
+          lastSlotId = pick.slot;
+          debugSlot = pick.slot;
+          liveLocalized = true;
+          snapCount++;
+        }
+      }
 
-      if (coverBoxes.length === 0) {
+      if (next.length === 0) {
+        // Trajectory hold only when live signature missing — still one box, no dual ghost.
+        const predicted = bboxAtTime(detection.trajectory, video.currentTime, W, H, detection.padding);
         const snap = snapBboxToLocalBright(ctx, predicted, W, H, detection.padding);
-        coverBoxes.push(expandBoxForDrift(snap.bbox, W, H));
+        next.push(expandBoxForDrift(snap.bbox, W, H));
         if (snap.snapped) {
           snapCount++;
-          localized = true;
+          liveLocalized = true;
           lastSlotId = slotIdOfPoint(
             snap.bbox.x + snap.bbox.width / 2, snap.bbox.y + snap.bbox.height / 2, W, H
           );
           debugSlot = lastSlotId;
+        } else {
+          liveLocalized = false;
+          debugSlot = lastSlotId;
         }
-      } else {
-        // Also cover predicted slot during hop windows so lag can't leave glyphs.
-        const predExp = expandBoxForDrift(predicted, W, H);
-        if (!boxesOverlap(predExp, coverBoxes[0])) {
-          coverBoxes.push(predExp);
+      }
+
+      // Replace entirely — never keep previous TL when mark hopped to MR.
+      liveCoverBoxes = next;
+      // Full-quality patch once per detect tick (ROI-sized, ~10 Hz) — cheap vs full-frame.
+      const tNow = video.currentTime;
+      for (const bbox of liveCoverBoxes) {
+        if (patchRegion(ctx, maskCtx, maskCanvas, references, tNow, bbox, W, H, quality)) {
+          nuclearAppliedTotal++;
         }
+      }
+      void debugSlot;
+    };
+
+    const drawFrame = () => {
+      if (signal?.aborted) {
+        try {
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            try { mediaRecorder.requestData(); } catch { /* ignore */ }
+            mediaRecorder.stop();
+          }
+        } catch { /* ignore */ }
+        return;
+      }
+      if (video.paused || video.ended) {
+        try {
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            try { mediaRecorder.requestData(); } catch { /* ignore */ }
+            mediaRecorder.stop();
+          }
+        } catch { /* ignore */ }
+        return;
+      }
+
+      // Always paint base + cover so captureStream gets a video frame this tick.
+      ctx.drawImage(video, 0, 0, W, H);
+
+      const now = performance.now();
+      if (now - lastDetectMs >= REMOVAL_DETECT_INTERVAL_MS) {
+        lastDetectMs = now;
+        refreshLiveSlots();
+      }
+
+      // If detect hasn't run yet, seed from trajectory so first frames aren't bare.
+      if (liveCoverBoxes.length === 0) {
+        const predicted = bboxAtTime(detection.trajectory, video.currentTime, W, H, detection.padding);
+        liveCoverBoxes = [expandBoxForDrift(predicted, W, H)];
       }
 
       let nuclearApplied = false;
-      for (const bbox of coverBoxes) {
-        if (patchRegion(ctx, maskCtx, maskCanvas, references, t, bbox, W, H, quality)) {
-          nuclearApplied = true;
-        }
+      for (const bbox of liveCoverBoxes) {
+        if (fastOpaqueCover(ctx, bbox, W, H)) nuclearApplied = true;
       }
       if (nuclearApplied) nuclearAppliedTotal++;
 
+      const t = video.currentTime;
       if (isSoraWmDebug()) {
         const sec = Math.floor(t);
         if (sec !== lastDebugSec) {
           lastDebugSec = sec;
-          const b = coverBoxes[0];
+          const b = liveCoverBoxes[0];
           console.log(
-            `[sora-wm] t=${t.toFixed(2)}s slot=${debugSlot ?? lastSlotId ?? '?'} ` +
-            `boxes=${coverBoxes.length} bbox=${b ? `${b.x},${b.y} ${b.width}x${b.height}` : 'none'} ` +
+            `[sora-wm] t=${t.toFixed(2)}s slot=${lastSlotId ?? '?'} ` +
+            `boxes=${liveCoverBoxes.length} bbox=${b ? `${b.x},${b.y} ${b.width}x${b.height}` : 'none'} ` +
             `nuclearTotal=${nuclearAppliedTotal}`
           );
         }
@@ -529,8 +612,8 @@ export async function removeSoraWatermark(
 
       if (duration > 0) {
         const pct = 25 + (t / duration) * 75;
-        const note = localized
-          ? `Reconstructing frames (slot=${debugSlot ?? lastSlotId ?? '?'}, covers=${coverBoxes.length}, nuclearApplied=${nuclearAppliedTotal})`
+        const note = liveLocalized
+          ? `Reconstructing frames (slot=${lastSlotId ?? '?'}, covers=${liveCoverBoxes.length}, nuclearApplied=${nuclearAppliedTotal})`
           : `Reconstructing frames (hold predict, nuclearApplied=${nuclearAppliedTotal})`;
         onProgress?.(Math.min(99.9, pct), note);
       }
@@ -541,10 +624,23 @@ export async function removeSoraWatermark(
       audioContext?.resume().catch(() => undefined);
       rafId = requestAnimationFrame(drawFrame);
     };
-    video.onended = () => { try { mediaRecorder?.stop(); } catch { /* ignore */ } };
+    video.onended = () => {
+      try {
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+          try { mediaRecorder.requestData(); } catch { /* ignore */ }
+          mediaRecorder.stop();
+        }
+      } catch { /* ignore */ }
+    };
 
     onProgress?.(25, 'Reconstructing frames');
-    mediaRecorder.start();
+    // Seed a painted frame BEFORE start so the video track is not empty.
+    ctx.drawImage(video, 0, 0, W, H);
+    refreshLiveSlots();
+    for (const bbox of liveCoverBoxes) fastOpaqueCover(ctx, bbox, W, H);
+
+    // Timeslice keeps chunks flowing even if stop is delayed; also forces encoder wakeups.
+    mediaRecorder.start(RECORD_TIMESLICE_MS);
     await video.play();
     await recordingDone;
 
@@ -865,6 +961,36 @@ interface SlotPick {
   bbox: WatermarkCoords;
   score: number;
   confidence: number;
+  eye: number;
+}
+
+/**
+ * Score logo+text bright clusters inside each of the 9 dwell slots (and
+ * optionally boost the previous slot). Returns the best slot's cluster bbox
+ * in full-image coordinates. Piecewise-constant tracking prior for Sora hops.
+ */
+function scoreSlotCluster(
+  hit: CandidateBox,
+  eye: number,
+  id: SlotId,
+  frameH: number
+): number | null {
+  const heightFrac = hit.bbox.height / Math.max(1, frameH);
+  const heightDev = Math.abs(heightFrac - MARK_HEIGHT_FRAC) / MARK_HEIGHT_FRAC;
+  // Reject face/sky blobs that aren't a ~3.5% H strip.
+  if (heightDev > MARK_HEIGHT_TOL * 1.6) return null;
+  const aspect = hit.bbox.width / Math.max(1, hit.bbox.height);
+  if (aspect < ASPECT_PRIOR_SOFT_MIN || aspect > ASPECT_PRIOR_SOFT_MAX) return null;
+
+  let score = (hit.confidence / 100) * SLOT_EDGE_WEIGHT[id] * (0.40 + 0.60 * Math.max(eye, 0.05));
+  score += eye * 0.85; // watermark signature dominates brightness
+  // Size prior: reward ~3.5% H; heavily penalize oversized clusters.
+  score *= clamp(1.25 - heightDev / MARK_HEIGHT_TOL, 0.15, 1.2);
+  if (aspect >= ASPECT_PRIOR_MIN && aspect <= ASPECT_PRIOR_MAX) score += 0.12;
+  // Face-like: tall boxes vs strip prior.
+  if (heightFrac > MARK_HEIGHT_FRAC * 2.0) score *= 0.25;
+  if (id === 'C') score *= 0.35;
+  return score;
 }
 
 /**
@@ -877,17 +1003,19 @@ function pickBestSlot(
   W: number,
   H: number,
   prevSlot: SlotId | null,
-  opts: { sticky?: boolean } = {}
+  opts: { sticky?: boolean; requireEyes?: boolean } = {}
 ): SlotPick | null {
   const sticky = opts.sticky !== false; // default sticky for detection trajectory
+  const requireEyes = opts.requireEyes === true;
   const stickBonus = sticky ? SLOT_STICK_BONUS : SLOT_STICK_BONUS_REMOVAL;
   const switchMargin = sticky ? SLOT_SWITCH_MARGIN : SLOT_SWITCH_MARGIN_REMOVAL;
+  const minEye = requireEyes ? REMOVAL_MIN_EYE : 0.12;
 
   let best: SlotPick | null = null;
-  for (const id of SLOT_IDS) {
+  const src = imageData.data;
+  for (const id of SLOT_SEARCH_ORDER) {
     const rect = slotRect(id, W, H);
     const crop = new ImageData(rect.width, rect.height);
-    const src = imageData.data;
     const dst = crop.data;
     for (let y = 0; y < rect.height; y++) {
       for (let x = 0; x < rect.width; x++) {
@@ -907,10 +1035,11 @@ function pickBestSlot(
       height: Math.min(H - Math.max(0, rect.y + hit.bbox.y - 2), hit.bbox.height + 4),
     };
     const eye = soraIconEyeBonus(src, W, eyeBox);
-    let score = (hit.confidence / 100) * SLOT_EDGE_WEIGHT[id] * (0.55 + 0.45 * Math.max(eye, 0.15));
-    score += eye * 0.55;
-    if (prevSlot === id) score += stickBonus;
-    if (!best || score > best.score) {
+    if (eye < minEye) continue;
+    const score = scoreSlotCluster(hit, eye, id, H);
+    if (score === null) continue;
+    const finalScore = score + (prevSlot === id ? stickBonus : 0);
+    if (!best || finalScore > best.score) {
       best = {
         slot: id,
         bbox: {
@@ -919,8 +1048,9 @@ function pickBestSlot(
           width: hit.bbox.width,
           height: hit.bbox.height,
         },
-        score,
+        score: finalScore,
         confidence: hit.confidence,
+        eye,
       };
     }
   }
@@ -931,7 +1061,6 @@ function pickBestSlot(
   if (sticky && prevSlot && best.slot !== prevSlot) {
     const prevRect = slotRect(prevSlot, W, H);
     const crop = new ImageData(prevRect.width, prevRect.height);
-    const src = imageData.data;
     const dst = crop.data;
     for (let y = 0; y < prevRect.height; y++) {
       for (let x = 0; x < prevRect.width; x++) {
@@ -951,25 +1080,26 @@ function pickBestSlot(
         height: Math.min(H, prevHit.bbox.height + 4),
       };
       const prevEye = soraIconEyeBonus(src, W, prevEyeBox);
-      const prevScore =
-        (prevHit.confidence / 100) * SLOT_EDGE_WEIGHT[prevSlot] * (0.55 + 0.45 * Math.max(prevEye, 0.15))
-        + prevEye * 0.55
-        + stickBonus;
-      const challengerHasEyes = best.score > 0.9;
-      const prevLostEyes = prevEye < 0.3;
-      const allowHop = challengerHasEyes && prevLostEyes;
-      if (!allowHop && best.score < prevScore + switchMargin) {
-        return {
-          slot: prevSlot,
-          bbox: {
-            x: prevRect.x + prevHit.bbox.x,
-            y: prevRect.y + prevHit.bbox.y,
-            width: prevHit.bbox.width,
-            height: prevHit.bbox.height,
-          },
-          score: prevScore,
-          confidence: prevHit.confidence,
-        };
+      const prevScoreRaw = scoreSlotCluster(prevHit, prevEye, prevSlot, H);
+      if (prevScoreRaw !== null) {
+        const prevScore = prevScoreRaw + stickBonus;
+        const challengerHasEyes = best.eye >= REMOVAL_MIN_EYE;
+        const prevLostEyes = prevEye < 0.22;
+        const allowHop = challengerHasEyes && (prevLostEyes || best.score > prevScore + switchMargin * 0.5);
+        if (!allowHop && best.score < prevScore + switchMargin) {
+          return {
+            slot: prevSlot,
+            bbox: {
+              x: prevRect.x + prevHit.bbox.x,
+              y: prevRect.y + prevHit.bbox.y,
+              width: prevHit.bbox.width,
+              height: prevHit.bbox.height,
+            },
+            score: prevScore,
+            confidence: prevHit.confidence,
+            eye: prevEye,
+          };
+        }
       }
     }
   }
@@ -977,22 +1107,23 @@ function pickBestSlot(
 }
 
 /**
- * Score all 9 slots and return every pick above minScore (sorted best-first).
- * Used during removal so we can opaque-cover the live mark even if a stale
- * trajectory slot still scores.
+ * Score slots and return every pick above minScore (sorted best-first).
+ * When requireEyes is set, brightness-only face/sky locks are dropped.
  */
 function collectStrongSlotPicks(
   imageData: ImageData,
   W: number,
   H: number,
-  minScore: number
+  minScore: number,
+  opts: { requireEyes?: boolean } = {}
 ): SlotPick[] {
-  // Direct per-slot scoring (no hysteresis):
+  const requireEyes = opts.requireEyes !== false; // default true for removal path
+  const minEye = requireEyes ? REMOVAL_MIN_EYE : 0.12;
   const out: SlotPick[] = [];
-  for (const id of SLOT_IDS) {
+  const src = imageData.data;
+  for (const id of SLOT_SEARCH_ORDER) {
     const rect = slotRect(id, W, H);
     const crop = new ImageData(rect.width, rect.height);
-    const src = imageData.data;
     const dst = crop.data;
     for (let y = 0; y < rect.height; y++) {
       for (let x = 0; x < rect.width; x++) {
@@ -1012,11 +1143,9 @@ function collectStrongSlotPicks(
       height: Math.min(H - Math.max(0, rect.y + hit.bbox.y - 2), hit.bbox.height + 4),
     };
     const eye = soraIconEyeBonus(src, W, eyeBox);
-    // Require some eye evidence OR strong edge strip — reject face/vest glare.
-    if (eye < 0.15 && SLOT_EDGE_WEIGHT[id] < 0.9) continue;
-    let score = (hit.confidence / 100) * SLOT_EDGE_WEIGHT[id] * (0.55 + 0.45 * Math.max(eye, 0.15));
-    score += eye * 0.55;
-    if (score < minScore) continue;
+    if (eye < minEye) continue;
+    const score = scoreSlotCluster(hit, eye, id, H);
+    if (score === null || score < minScore) continue;
     out.push({
       slot: id,
       bbox: {
@@ -1027,6 +1156,7 @@ function collectStrongSlotPicks(
       },
       score,
       confidence: hit.confidence,
+      eye,
     });
   }
   out.sort((a, b) => b.score - a.score);
@@ -1034,8 +1164,6 @@ function collectStrongSlotPicks(
 }
 
 /**
-
-
  * Sora's cloud logo has two dark "eye" ovals inside a bright blob. Sky/asphalt
  * bright clusters lack this signature. Returns 0..1 bonus.
  */
@@ -1232,7 +1360,7 @@ function findBrightTranslucentCluster(
     // Size prior: height must sit near 3.5% of frame (reject sky blobs / noise).
     const heightFrac = c.bbox.height / Math.max(1, H);
     const heightDev = Math.abs(heightFrac - MARK_HEIGHT_FRAC) / MARK_HEIGHT_FRAC;
-    if (heightDev > MARK_HEIGHT_TOL * 2.2) continue; // absurd vs forensic anchor
+    if (heightDev > MARK_HEIGHT_TOL * 1.85) continue; // absurd vs forensic ~3.5% H strip
     const sizeErr =
       Math.abs(c.bbox.width - idealW) / idealW +
       Math.abs(c.bbox.height - idealH) / idealH;
@@ -1897,6 +2025,49 @@ function applyResidualOpaqueKill(
  * Trajectory interpolation (even with teleport hold) drifts; snapping each
  * frame to the local bright logo+text cluster keeps the ROI on the glyphs.
  */
+/**
+ * Lightweight opaque cover for the record loop. Avoids Telea / multi-ref / full
+ * mask morphology that previously starved MediaRecorder of video frames.
+ * Still fully occludes the logo+text strip with border-mean nuclear fill.
+ */
+function fastOpaqueCover(
+  ctx: CanvasRenderingContext2D,
+  bbox: WatermarkCoords,
+  W: number,
+  H: number
+): boolean {
+  const box = clampBox(bbox, W, H);
+  if (box.width <= 2 || box.height <= 2) return false;
+  let roi: ImageData;
+  try {
+    roi = ctx.getImageData(box.x, box.y, box.width, box.height);
+  } catch {
+    return false;
+  }
+  const bw = box.width;
+  const bh = box.height;
+  const original = roi.data;
+  const alpha = new Uint8ClampedArray(bw * bh);
+  // Soft strip prior only — no dilate/close (too expensive for every RAF).
+  const prior = new Uint8Array(bw * bh);
+  softStripPriorAlpha(bw, bh, prior);
+  for (let i = 0; i < bw * bh; i++) alpha[i] = prior[i];
+
+  const border = borderMeanRgb(
+    original, alpha, bw, bh,
+    Math.max(2, Math.round(Math.min(bw, bh) * 0.1))
+  );
+  applyNuclearFill(original, [], bw, bh, border, false);
+  applyResidualOpaqueKill(original, bw, bh, border);
+  const afterFrac = brightFractionInRoi(roi);
+  if (afterFrac >= NUCLEAR_SECOND_PASS_FRAC) {
+    applyNuclearFill(original, [], bw, bh, border, true);
+    applyResidualOpaqueKill(original, bw, bh, border);
+  }
+  ctx.putImageData(roi, box.x, box.y);
+  return true;
+}
+
 function snapBboxToLocalBright(
   ctx: CanvasRenderingContext2D,
   predicted: WatermarkCoords,
