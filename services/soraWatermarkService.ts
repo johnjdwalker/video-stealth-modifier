@@ -18,9 +18,9 @@ import {
 //      every covered pixel.
 // ----------------------------------------------------------------------------
 
-const DETECTION_TARGET_SAMPLES = 72;        // denser trajectory sampling along the clip
-const DETECTION_MAX_SAMPLE_INTERVAL = 0.45; // seconds; clamps very long videos
-const DETECTION_MIN_SAMPLE_INTERVAL = 0.08; // seconds; clamps very short videos
+const DETECTION_TARGET_SAMPLES = 110;       // denser — Sora logo teleports between corners
+const DETECTION_MAX_SAMPLE_INTERVAL = 0.28; // seconds; clamps very long videos
+const DETECTION_MIN_SAMPLE_INTERVAL = 0.05; // seconds; clamps very short videos
 
 // Luminance threshold (0-255). Pixels brighter than this are watermark candidates.
 const BRIGHT_THRESHOLD = 200;
@@ -31,8 +31,10 @@ const DETECTION_WORK_WIDTH = 640;
 
 // Watermark size constraints, expressed as fractions of the video's longer side.
 // Sora's logo is small relative to the frame.
-const MIN_WATERMARK_FRAC = 0.02;
-const MAX_WATERMARK_FRAC = 0.30;
+const MIN_WATERMARK_FRAC = 0.015;
+// Hard cap: reject huge sky/asphalt/face blobs that drown the small logo+text strip.
+const MAX_WATERMARK_FRAC = 0.16;
+const MAX_WATERMARK_HEIGHT_FRAC = 0.14;
 
 // Sora logo+text strip aspect prior (width/height). Typical strip is wide.
 const ASPECT_PRIOR_MIN = 1.4;
@@ -56,9 +58,35 @@ const MASK_CLOSE_PX = 4;
 
 // Padding (in pixels at full resolution) added around each detected bbox to
 // catch soft edges, antialiasing, thin text, and slight motion between samples.
-const DEFAULT_PADDING = 28;
-// Extra horizontal padding — Sora text strip is wider than the logo alone.
-const DEFAULT_PADDING_X_EXTRA = 16;
+const DEFAULT_PADDING = 34;
+// Extra horizontal padding — Sora text strip + @username is wider than the logo alone.
+const DEFAULT_PADDING_X_EXTRA = 28;
+// Extra vertical padding — handle line sits below "Sora".
+const DEFAULT_PADDING_Y_EXTRA = 14;
+// Morphological close radius (work-res) before connected components — merges glyph strokes.
+const DETECT_CLOSE_PX = 5;
+// (Trajectory is piecewise-constant across slot hops; no spatial lerp.)
+// Per-frame snap: search pad around predicted bbox (full-res px).
+const SNAP_SEARCH_PAD = 140;
+const SNAP_MIN_SCORE = 0.34;
+
+// ---------------------------------------------------------------------------
+// 9-slot dwell prior (Sora hops between edge/corner cells; multi-second holds).
+// Slots: TL TC TR / ML C MR / BL BC BR. Corners & edges preferred over center.
+// Trajectory is piecewise-constant across slot changes — never lerp mid-frame.
+// ---------------------------------------------------------------------------
+const SLOT_IDS = ['TL','TC','TR','ML','C','MR','BL','BC','BR'] as const;
+type SlotId = typeof SLOT_IDS[number];
+/** Soft prior weight per slot (corners highest, center lowest). */
+const SLOT_EDGE_WEIGHT: Record<SlotId, number> = {
+  TL: 1.00, TC: 0.78, TR: 1.00,
+  ML: 0.78, C: 0.35, MR: 0.78,
+  BL: 1.00, BC: 0.78, BR: 1.00,
+};
+/** Hysteresis: new slot must beat current by this margin to switch. */
+const SLOT_SWITCH_MARGIN = 0.08;
+/** Stickiness bonus for remaining in the previous slot. */
+const SLOT_STICK_BONUS = 0.12;
 
 // How many clean donor frames to blend for each patch (edge-aware multi-ref).
 const MULTI_REF_BLEND = 5;
@@ -187,8 +215,16 @@ export async function detectSoraWatermark(
       await seekTo(video, t);
       ctx.drawImage(video, 0, 0, workW, workH);
       const imageData = ctx.getImageData(0, 0, workW, workH);
-      const candidate = findBrightTranslucentCluster(imageData, workW, workH, prevBoxWork);
-      if (candidate) {
+      const prevSlot = prevBoxWork
+        ? slotIdOfPoint(
+            prevBoxWork.x + prevBoxWork.width / 2,
+            prevBoxWork.y + prevBoxWork.height / 2,
+            workW, workH
+          )
+        : null;
+      // 9-slot dwell prior: score logo+text inside each edge/corner cell.
+      const candidate = pickBestSlot(imageData, workW, workH, prevSlot);
+      if (candidate && candidate.score >= SNAP_MIN_SCORE * 0.85) {
         // Scale work-resolution box back to video resolution.
         const bbox: WatermarkCoords = {
           x: Math.round(candidate.bbox.x / scale),
@@ -374,6 +410,9 @@ export async function removeSoraWatermark(
       };
     });
 
+    let snapCount = 0;
+    let lastSlotId: SlotId | null = null;
+    let nuclearAppliedTotal = 0;
     const drawFrame = () => {
       if (signal?.aborted) {
         try { mediaRecorder?.stop(); } catch { /* ignore */ }
@@ -385,14 +424,43 @@ export async function removeSoraWatermark(
       }
       ctx.drawImage(video, 0, 0, W, H);
 
-      const t = video.currentTime;
-      const bbox = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
+            const t = video.currentTime;
+      const predicted = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
 
-      patchRegion(ctx, maskCtx, maskCanvas, references, t, bbox, W, H, quality);
+      // Per-frame 9-slot dwell re-score: hold on edge/corner until evidence hops.
+      let bbox = predicted;
+      let localized = false;
+      try {
+        const frame = ctx.getImageData(0, 0, W, H);
+        const pick = pickBestSlot(frame, W, H, lastSlotId);
+        if (pick && pick.score >= SNAP_MIN_SCORE) {
+          bbox = padBox(pick.bbox, detection.padding, W, H);
+          lastSlotId = pick.slot;
+          localized = true;
+          snapCount++;
+        }
+      } catch { /* getImageData can throw on tainted canvas — fall through */ }
+      if (!localized) {
+        const snap = snapBboxToLocalBright(ctx, predicted, W, H, detection.padding);
+        bbox = snap.bbox;
+        if (snap.snapped) {
+          snapCount++;
+          localized = true;
+          lastSlotId = slotIdOfPoint(
+            bbox.x + bbox.width / 2, bbox.y + bbox.height / 2, W, H
+          );
+        }
+      }
+
+      const nuclearApplied = patchRegion(ctx, maskCtx, maskCanvas, references, t, bbox, W, H, quality);
+      if (nuclearApplied) nuclearAppliedTotal++;
 
       if (duration > 0) {
         const pct = 25 + (t / duration) * 75;
-        onProgress?.(Math.min(99.9, pct), 'Reconstructing frames');
+        const note = localized
+          ? `Reconstructing frames (slot=${lastSlotId ?? '?'}, nuclearApplied=${nuclearAppliedTotal})`
+          : `Reconstructing frames (hold predict, nuclearApplied=${nuclearAppliedTotal})`;
+        onProgress?.(Math.min(99.9, pct), note);
       }
       rafId = requestAnimationFrame(drawFrame);
     };
@@ -695,6 +763,228 @@ interface CandidateBox {
  * Find a small bright low-saturation cluster — the visual signature of Sora's
  * translucent white logo. Returns null if no plausible candidate is found.
  */
+
+/** Axis-aligned ROI for a dwell slot (overlapping thirds so edge marks aren't clipped). */
+function slotRect(id: SlotId, W: number, H: number): WatermarkCoords {
+  const col = (id === 'TL' || id === 'ML' || id === 'BL') ? 0
+    : (id === 'TC' || id === 'C' || id === 'BC') ? 1 : 2;
+  const row = (id === 'TL' || id === 'TC' || id === 'TR') ? 0
+    : (id === 'ML' || id === 'C' || id === 'MR') ? 1 : 2;
+  const x0 = Math.floor(W * (col === 0 ? 0 : col === 1 ? 0.28 : 0.58));
+  const x1 = Math.ceil(W * (col === 0 ? 0.42 : col === 1 ? 0.72 : 1));
+  const y0 = Math.floor(H * (row === 0 ? 0 : row === 1 ? 0.28 : 0.58));
+  const y1 = Math.ceil(H * (row === 0 ? 0.42 : row === 1 ? 0.72 : 1));
+  return {
+    x: clamp(x0, 0, W - 1),
+    y: clamp(y0, 0, H - 1),
+    width: clamp(x1 - x0, 1, W - x0),
+    height: clamp(y1 - y0, 1, H - y0),
+  };
+}
+
+function slotIdOfPoint(x: number, y: number, W: number, H: number): SlotId {
+  const col = x < W * 0.33 ? 0 : x < W * 0.66 ? 1 : 2;
+  const row = y < H * 0.33 ? 0 : y < H * 0.66 ? 1 : 2;
+  return SLOT_IDS[row * 3 + col];
+}
+
+interface SlotPick {
+  slot: SlotId;
+  bbox: WatermarkCoords;
+  score: number;
+  confidence: number;
+}
+
+/**
+ * Score logo+text bright clusters inside each of the 9 dwell slots (and
+ * optionally boost the previous slot). Returns the best slot's cluster bbox
+ * in full-image coordinates. Piecewise-constant tracking prior for Sora hops.
+ */
+function pickBestSlot(
+  imageData: ImageData,
+  W: number,
+  H: number,
+  prevSlot: SlotId | null
+): SlotPick | null {
+  let best: SlotPick | null = null;
+  for (const id of SLOT_IDS) {
+    const rect = slotRect(id, W, H);
+    // Extract slot crop into a temporary ImageData for the cluster finder.
+    const crop = new ImageData(rect.width, rect.height);
+    const src = imageData.data;
+    const dst = crop.data;
+    for (let y = 0; y < rect.height; y++) {
+      for (let x = 0; x < rect.width; x++) {
+        const si = ((rect.y + y) * W + (rect.x + x)) * 4;
+        const di = (y * rect.width + x) * 4;
+        dst[di] = src[si]; dst[di + 1] = src[si + 1];
+        dst[di + 2] = src[si + 2]; dst[di + 3] = src[si + 3];
+      }
+    }
+    const hit = findBrightTranslucentCluster(crop, rect.width, rect.height, null);
+    if (!hit) continue;
+    // Normalize confidence to 0..1 and apply edge prior + stickiness.
+    // Eye-pair signature on the full-frame crop strongly prefers real Sora logo.
+    // Expand horizontally — cloud icon often CC-separates from "Sora"/@handle.
+    const ex = Math.max(6, Math.round(hit.bbox.width * 0.55));
+    const eyeBox = {
+      x: Math.max(0, rect.x + hit.bbox.x - ex),
+      y: Math.max(0, rect.y + hit.bbox.y - 2),
+      width: Math.min(W - Math.max(0, rect.x + hit.bbox.x - ex), hit.bbox.width + ex * 2),
+      height: Math.min(H - Math.max(0, rect.y + hit.bbox.y - 2), hit.bbox.height + 4),
+    };
+    const eye = soraIconEyeBonus(src, W, eyeBox);
+    let score = (hit.confidence / 100) * SLOT_EDGE_WEIGHT[id] * (0.55 + 0.45 * Math.max(eye, 0.15));
+    score += eye * 0.55; // decisive: cloud-eyes beat sky/asphalt blobs
+    if (prevSlot === id) score += SLOT_STICK_BONUS;
+    if (!best || score > best.score) {
+      best = {
+        slot: id,
+        bbox: {
+          x: rect.x + hit.bbox.x,
+          y: rect.y + hit.bbox.y,
+          width: hit.bbox.width,
+          height: hit.bbox.height,
+        },
+        score,
+        confidence: hit.confidence,
+      };
+    }
+  }
+  if (!best) return null;
+  // Hysteresis: keep previous slot unless challenger beats it by margin.
+  // Exception: if challenger has strong cloud-eye evidence and prev does not,
+  // allow the hop (Sora teleports to a new corner/edge).
+  if (prevSlot && best.slot !== prevSlot) {
+    const prevRect = slotRect(prevSlot, W, H);
+    const crop = new ImageData(prevRect.width, prevRect.height);
+    const src = imageData.data;
+    const dst = crop.data;
+    for (let y = 0; y < prevRect.height; y++) {
+      for (let x = 0; x < prevRect.width; x++) {
+        const si = ((prevRect.y + y) * W + (prevRect.x + x)) * 4;
+        const di = (y * prevRect.width + x) * 4;
+        dst[di] = src[si]; dst[di + 1] = src[si + 1];
+        dst[di + 2] = src[si + 2]; dst[di + 3] = src[si + 3];
+      }
+    }
+    const prevHit = findBrightTranslucentCluster(crop, prevRect.width, prevRect.height, null);
+    if (prevHit) {
+      const ex = Math.max(6, Math.round(prevHit.bbox.width * 0.55));
+      const prevEyeBox = {
+        x: Math.max(0, prevRect.x + prevHit.bbox.x - ex),
+        y: Math.max(0, prevRect.y + prevHit.bbox.y - 2),
+        width: Math.min(W, prevHit.bbox.width + ex * 2),
+        height: Math.min(H, prevHit.bbox.height + 4),
+      };
+      const prevEye = soraIconEyeBonus(src, W, prevEyeBox);
+      const prevScore =
+        (prevHit.confidence / 100) * SLOT_EDGE_WEIGHT[prevSlot] * (0.55 + 0.45 * Math.max(prevEye, 0.15))
+        + prevEye * 0.55
+        + SLOT_STICK_BONUS;
+      const challengerHasEyes = best.score > 0.9; // eye-boosted scores land higher
+      const prevLostEyes = prevEye < 0.3;
+      const allowHop = challengerHasEyes && prevLostEyes;
+      if (!allowHop && best.score < prevScore + SLOT_SWITCH_MARGIN) {
+        return {
+          slot: prevSlot,
+          bbox: {
+            x: prevRect.x + prevHit.bbox.x,
+            y: prevRect.y + prevHit.bbox.y,
+            width: prevHit.bbox.width,
+            height: prevHit.bbox.height,
+          },
+          score: prevScore,
+          confidence: prevHit.confidence,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+
+/**
+ * Sora's cloud logo has two dark "eye" ovals inside a bright blob. Sky/asphalt
+ * bright clusters lack this signature. Returns 0..1 bonus.
+ */
+function soraIconEyeBonus(
+  data: Uint8ClampedArray,
+  W: number,
+  bbox: WatermarkCoords
+): number {
+  const x0 = bbox.x, y0 = bbox.y, bw = bbox.width, bh = bbox.height;
+  if (bw < 12 || bh < 10) return 0;
+  // Dark pixels that sit inside / adjacent to bright white (holes in the logo).
+  const dark = new Uint8Array(bw * bh);
+  let darkCount = 0;
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const p = ((y0 + y) * W + (x0 + x)) * 4;
+      const r = data[p], g = data[p + 1], b = data[p + 2];
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      const maxC = Math.max(r, g, b), minC = Math.min(r, g, b);
+      const sat = maxC - minC;
+      const hole = lum <= 110 && sat <= 80;
+      if (!hole) continue;
+      // Require a bright neighbor so we score holes-in-white, not dark asphalt.
+      let nearBright = false;
+      for (let dy = -2; dy <= 2 && !nearBright; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) continue;
+          const q = ((y0 + yy) * W + (x0 + xx)) * 4;
+          const rr = data[q], gg = data[q + 1], bb = data[q + 2];
+          const l2 = 0.299 * rr + 0.587 * gg + 0.114 * bb;
+          const s2 = Math.max(rr, gg, bb) - Math.min(rr, gg, bb);
+          if (l2 >= BRIGHT_THRESHOLD - 10 && s2 <= LOW_SATURATION_THRESHOLD + 20) {
+            nearBright = true;
+          }
+        }
+      }
+      if (nearBright) { dark[y * bw + x] = 1; darkCount++; }
+    }
+  }
+  if (darkCount < 8) return 0;
+
+  // Connected components of dark holes — expect ~2 eye blobs.
+  const vis = new Uint8Array(bw * bh);
+  const holes: { cx: number; cy: number; n: number; w: number; h: number }[] = [];
+  const stack: number[] = [];
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const i = y * bw + x;
+      if (!dark[i] || vis[i]) continue;
+      let minX = x, maxX = x, minY = y, maxY = y, n = 0, sx = 0, sy = 0;
+      stack.length = 0; stack.push(i); vis[i] = 1;
+      while (stack.length) {
+        const idx = stack.pop()!;
+        const cy = (idx / bw) | 0, cx = idx - cy * bw;
+        n++; sx += cx; sy += cy;
+        if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+        if (cx > 0) { const k = idx - 1; if (dark[k] && !vis[k]) { vis[k] = 1; stack.push(k); } }
+        if (cx < bw - 1) { const k = idx + 1; if (dark[k] && !vis[k]) { vis[k] = 1; stack.push(k); } }
+        if (cy > 0) { const k = idx - bw; if (dark[k] && !vis[k]) { vis[k] = 1; stack.push(k); } }
+        if (cy < bh - 1) { const k = idx + bw; if (dark[k] && !vis[k]) { vis[k] = 1; stack.push(k); } }
+      }
+      const hw = maxX - minX + 1, hh = maxY - minY + 1;
+      if (n >= 4 && n <= 400 && hw <= bw * 0.5 && hh <= bh * 0.7) {
+        holes.push({ cx: sx / n, cy: sy / n, n, w: hw, h: hh });
+      }
+    }
+  }
+  if (holes.length < 2) return holes.length === 1 ? 0.15 : 0;
+  holes.sort((a, b) => b.n - a.n);
+  const a = holes[0], b = holes[1];
+  const sizeRatio = Math.min(a.n, b.n) / Math.max(a.n, b.n);
+  const dx = Math.abs(a.cx - b.cx), dy = Math.abs(a.cy - b.cy);
+  const horizontallyPaired = dx >= 3 && dx <= bw * 0.55 && dy <= Math.max(6, bh * 0.35);
+  if (!horizontallyPaired || sizeRatio < 0.35) return 0.2;
+  // Strong match for two similar dark eyes side-by-side inside bright logo.
+  return clamp(0.55 + sizeRatio * 0.35 + (dy < bh * 0.2 ? 0.1 : 0), 0, 1);
+}
+
 function findBrightTranslucentCluster(
   imageData: ImageData,
   W: number,
@@ -703,7 +993,7 @@ function findBrightTranslucentCluster(
 ): CandidateBox | null {
   const data = imageData.data;
   // 1. Build a binary mask of bright low-saturation pixels.
-  const mask = new Uint8Array(W * H);
+  const raw = new Uint8Array(W * H);
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const idx = (y * W + x) * 4;
@@ -713,15 +1003,23 @@ function findBrightTranslucentCluster(
       const sat = maxC - minC;
       const lum = 0.299 * r + 0.587 * g + 0.114 * b;
       if (lum >= BRIGHT_THRESHOLD && sat <= LOW_SATURATION_THRESHOLD) {
-        mask[y * W + x] = 1;
+        raw[y * W + x] = 1;
       }
     }
   }
 
+  // Morphological close merges thin glyph strokes into one logo+text strip
+  // before connected components (otherwise "Sora" / "@user" shatter into tiny blobs).
+  const mask = DETECT_CLOSE_PX > 0
+    ? erodeBinary(dilateBinary(raw, W, H, DETECT_CLOSE_PX), W, H, DETECT_CLOSE_PX)
+    : raw;
+
   // 2. Connected components via flood fill.
   const longSide = Math.max(W, H);
-  const minSize = Math.max(20, Math.round(MIN_WATERMARK_FRAC * longSide * MIN_WATERMARK_FRAC * longSide));
-  const maxSize = Math.round(MAX_WATERMARK_FRAC * W * MAX_WATERMARK_FRAC * H);
+  const minSize = Math.max(16, Math.round(MIN_WATERMARK_FRAC * longSide * MIN_WATERMARK_FRAC * longSide));
+  const maxArea = Math.round(MAX_WATERMARK_FRAC * longSide * MAX_WATERMARK_HEIGHT_FRAC * longSide);
+  const maxW = Math.round(MAX_WATERMARK_FRAC * longSide);
+  const maxH = Math.round(MAX_WATERMARK_HEIGHT_FRAC * longSide);
   const visited = new Uint8Array(W * H);
   const candidates: { bbox: WatermarkCoords; pixelCount: number }[] = [];
 
@@ -730,7 +1028,6 @@ function findBrightTranslucentCluster(
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
       if (!mask[i] || visited[i]) continue;
-      // BFS / iterative flood
       let minX = x, maxX = x, minY = y, maxY = y, count = 0;
       stack.length = 0;
       stack.push(i);
@@ -752,23 +1049,25 @@ function findBrightTranslucentCluster(
       const bw = maxX - minX + 1;
       const bh = maxY - minY + 1;
       const area = bw * bh;
-      if (count >= minSize && area <= maxSize && bw >= 4 && bh >= 4) {
-        candidates.push({
-          bbox: { x: minX, y: minY, width: bw, height: bh },
-          pixelCount: count,
-        });
-      }
+      // Reject huge sky/face/asphalt blobs and tiny noise.
+      if (count < minSize || area > maxArea || bw > maxW || bh > maxH || bw < 4 || bh < 4) continue;
+      candidates.push({
+        bbox: { x: minX, y: minY, width: bw, height: bh },
+        pixelCount: count,
+      });
     }
   }
 
   if (candidates.length === 0) return null;
 
-  // 3. Score candidates: density, logo+text strip aspect prior, proximity to
-  // previous box, and preference for boxes near edges (Sora logo bounces).
+  // 3. Score: prefer mid-density wide strips of watermark size near edges.
+  // Solid bright blobs (sky, specular asphalt, vest glare) score poorly.
   let best: { score: number; bbox: WatermarkCoords; confidence: number } | null = null;
+  const idealW = longSide * 0.12;
+  const idealH = longSide * 0.055;
   for (const c of candidates) {
     const area = c.bbox.width * c.bbox.height;
-    const density = c.pixelCount / area; // 0-1, higher = denser
+    const density = c.pixelCount / area;
     const cx = c.bbox.x + c.bbox.width / 2;
     const cy = c.bbox.y + c.bbox.height / 2;
     const distToEdge = Math.min(cx, W - cx, cy, H - cy);
@@ -779,29 +1078,48 @@ function findBrightTranslucentCluster(
       const pcx = prevBox.x + prevBox.width / 2;
       const pcy = prevBox.y + prevBox.height / 2;
       const dist = Math.hypot(cx - pcx, cy - pcy);
-      motionBonus = 1 - clamp(dist / Math.hypot(W, H), 0, 1);
+      // Soft motion prior — do NOT lock onto a wrong prev (vest/face).
+      motionBonus = 1 - clamp(dist / (Math.hypot(W, H) * 0.55), 0, 1);
     }
 
-    // Aspect prior: Sora watermark is a wide logo+text strip, not a square blob.
     const aspect = c.bbox.width / Math.max(1, c.bbox.height);
-    let aspectBonus = 0.15;
+    let aspectBonus = 0.1;
     if (aspect >= ASPECT_PRIOR_MIN && aspect <= ASPECT_PRIOR_MAX) {
       aspectBonus = 1;
     } else if (aspect >= ASPECT_PRIOR_SOFT_MIN && aspect <= ASPECT_PRIOR_SOFT_MAX) {
-      aspectBonus = 0.55;
+      aspectBonus = 0.5;
     }
 
-    // Score weights: density + aspect prior are key; edge/motion refine.
-    const score = density * 0.40 + aspectBonus * 0.25 + edgeBonus * 0.15 + motionBonus * 0.20;
-    const confidence = Math.round(clamp((density * 0.7 + aspectBonus * 0.3) * 100, 0, 100));
+    // Text strips are mid-density; reject near-solid fills (sky/glare).
+    let densBonus = 0;
+    if (density >= 0.08 && density <= 0.55) densBonus = 1;
+    else if (density > 0.55 && density <= 0.72) densBonus = 0.45;
+    else if (density < 0.08) densBonus = clamp(density / 0.08, 0, 1) * 0.35;
+    else densBonus = 0.15; // very solid
+
+    // Size prior around typical logo+handle footprint.
+    const sizeErr =
+      Math.abs(c.bbox.width - idealW) / idealW +
+      Math.abs(c.bbox.height - idealH) / idealH;
+    const sizeBonus = clamp(1 - sizeErr * 0.55, 0, 1);
+
+    const score =
+      densBonus * 0.22 +
+      aspectBonus * 0.28 +
+      edgeBonus * 0.22 +
+      sizeBonus * 0.18 +
+      motionBonus * 0.10;
+    const confidence = Math.round(clamp(
+      (densBonus * 0.35 + aspectBonus * 0.35 + sizeBonus * 0.30) * 100,
+      0, 100
+    ));
     if (!best || score > best.score) {
       best = { score, bbox: c.bbox, confidence };
     }
   }
 
   if (!best) return null;
-  // Reject low-density / wrong-aspect blobs (likely a bright object, not a logo).
-  if (best.score < 0.32) return null;
+  if (best.score < SNAP_MIN_SCORE) return null;
   return { bbox: best.bbox, confidence: best.confidence };
 }
 
@@ -811,8 +1129,6 @@ function dropOutliers(
   H: number
 ): SoraWatermarkSample[] {
   if (samples.length < 4) return samples;
-  // Compute median center and median size; drop samples whose center is far
-  // from the median AND whose confidence is below average.
   const cxs = samples.map(s => s.bbox.x + s.bbox.width / 2);
   const cys = samples.map(s => s.bbox.y + s.bbox.height / 2);
   const median = (arr: number[]): number => {
@@ -824,11 +1140,43 @@ function dropOutliers(
   const diag = Math.hypot(W, H);
   const avgConf = samples.reduce((a, s) => a + s.confidence, 0) / samples.length;
 
-  return samples.filter((s, i) => {
+  // Pass 1: drop far-from-median low-confidence blobs (faces/vests/sky).
+  const pass1 = samples.filter((s, i) => {
     const dist = Math.hypot(cxs[i] - mcx, cys[i] - mcy);
     if (dist > diag * 0.55 && s.confidence < avgConf) return false;
+    // Reject absurdly large "watermarks".
+    const longSide = Math.max(W, H);
+    if (s.bbox.width > MAX_WATERMARK_FRAC * longSide * 1.15) return false;
+    if (s.bbox.height > MAX_WATERMARK_HEIGHT_FRAC * longSide * 1.25) return false;
     return true;
   });
+  if (pass1.length < 3) return pass1.length >= 2 ? pass1 : samples;
+
+  // Pass 2: velocity gate — keep teleports (Sora jumps corners) but drop
+  // isolated spikes that don't match neighbors on either side (false locks).
+  const kept: SoraWatermarkSample[] = [];
+  for (let i = 0; i < pass1.length; i++) {
+    const s = pass1[i];
+    const cx = s.bbox.x + s.bbox.width / 2;
+    const cy = s.bbox.y + s.bbox.height / 2;
+    const prev = i > 0 ? pass1[i - 1] : null;
+    const next = i + 1 < pass1.length ? pass1[i + 1] : null;
+    if (prev && next) {
+      const pcx = prev.bbox.x + prev.bbox.width / 2;
+      const pcy = prev.bbox.y + prev.bbox.height / 2;
+      const ncx = next.bbox.x + next.bbox.width / 2;
+      const ncy = next.bbox.y + next.bbox.height / 2;
+      const dPrev = Math.hypot(cx - pcx, cy - pcy);
+      const dNext = Math.hypot(cx - ncx, cy - ncy);
+      const dPN = Math.hypot(ncx - pcx, ncy - pcy);
+      // Spike: far from both neighbors while neighbors agree with each other.
+      if (dPrev > diag * 0.35 && dNext > diag * 0.35 && dPN < diag * 0.25 && s.confidence < avgConf + 5) {
+        continue;
+      }
+    }
+    kept.push(s);
+  }
+  return kept.length >= 2 ? kept : pass1;
 }
 
 /**
@@ -858,19 +1206,17 @@ function bboxAtTime(
   const b = trajectory[hi];
   const span = Math.max(1e-6, b.time - a.time);
   const u = clamp((t - a.time) / span, 0, 1);
-  const lerp = (av: number, bv: number) => av + (bv - av) * u;
-  const bbox: WatermarkCoords = {
-    x: Math.round(lerp(a.bbox.x, b.bbox.x)),
-    y: Math.round(lerp(a.bbox.y, b.bbox.y)),
-    width: Math.round(lerp(a.bbox.width, b.bbox.width)),
-    height: Math.round(lerp(a.bbox.height, b.bbox.height)),
-  };
-  return padBox(bbox, padding, W, H);
+
+  // Sora dwells for multi-second stretches on edge/corner slots, then hops.
+  // Piecewise-constant trajectory: hold A until the midpoint, then B.
+  // Never linearly interpolate across the frame (that paints empty mid-screen).
+  const hold = u < 0.5 ? a.bbox : b.bbox;
+  return padBox(hold, padding, W, H);
 }
 
 function padBox(b: WatermarkCoords, padding: number, W: number, H: number): WatermarkCoords {
   const padX = padding + DEFAULT_PADDING_X_EXTRA;
-  const padY = padding;
+  const padY = padding + DEFAULT_PADDING_Y_EXTRA;
   const x = clamp(b.x - padX, 0, W - 1);
   const y = clamp(b.y - padY, 0, H - 1);
   const width = clamp(b.width + padX * 2, 1, W - x);
@@ -1266,7 +1612,9 @@ function applyNuclearFill(
       const nx = (x - cx) / rx;
       const ny = (y - cy) / ry;
       const radial = clamp(1 - Math.sqrt(nx * nx + ny * ny), 0, 1);
-      const strength = clamp(t * (0.55 + 0.45 * radial), 0, 1);
+      // Hard core of the ROI is fully covered (opacity 1); only the outer feather
+      // ring blends. White glyphs cannot remain sharp inside the tracked bbox.
+      const strength = t >= 1 ? 1 : clamp(t * (0.88 + 0.12 * radial), 0, 1);
       if (strength < 0.02) continue;
       const p = (y * bw + x) * 4;
       let sr = best.data[p];
@@ -1299,6 +1647,60 @@ function applyNuclearFill(
   }
 }
 
+
+/**
+ * Re-detect the watermark inside a search window around the predicted bbox.
+ * Trajectory interpolation (even with teleport hold) drifts; snapping each
+ * frame to the local bright logo+text cluster keeps the ROI on the glyphs.
+ */
+function snapBboxToLocalBright(
+  ctx: CanvasRenderingContext2D,
+  predicted: WatermarkCoords,
+  W: number,
+  H: number,
+  padding: number
+): { bbox: WatermarkCoords; snapped: boolean; score: number } {
+  if (predicted.width <= 0 || predicted.height <= 0) {
+    return { bbox: predicted, snapped: false, score: 0 };
+  }
+  const pad = SNAP_SEARCH_PAD;
+  const sx = clamp(predicted.x - pad, 0, W - 1);
+  const sy = clamp(predicted.y - pad, 0, H - 1);
+  const sw = clamp(predicted.width + pad * 2, 1, W - sx);
+  const sh = clamp(predicted.height + pad * 2, 1, H - sy);
+  let search: ImageData;
+  try {
+    search = ctx.getImageData(sx, sy, sw, sh);
+  } catch {
+    return { bbox: predicted, snapped: false, score: 0 };
+  }
+  // Run cluster find in search-window coordinates (prev = predicted, shifted).
+  const prevLocal: WatermarkCoords = {
+    x: predicted.x - sx,
+    y: predicted.y - sy,
+    width: predicted.width,
+    height: predicted.height,
+  };
+  const hit = findBrightTranslucentCluster(search, sw, sh, prevLocal);
+  if (!hit || hit.confidence / 100 < SNAP_MIN_SCORE) {
+    // Also accept by raw score path: confidence already encodes quality.
+    if (!hit || hit.confidence < 34) {
+      return { bbox: predicted, snapped: false, score: hit ? hit.confidence / 100 : 0 };
+    }
+  }
+  const raw: WatermarkCoords = {
+    x: sx + hit.bbox.x,
+    y: sy + hit.bbox.y,
+    width: hit.bbox.width,
+    height: hit.bbox.height,
+  };
+  return {
+    bbox: padBox(raw, padding, W, H),
+    snapped: true,
+    score: hit.confidence / 100,
+  };
+}
+
 function patchRegion(
   ctx: CanvasRenderingContext2D,
   maskCtx: CanvasRenderingContext2D,
@@ -1309,13 +1711,13 @@ function patchRegion(
   W: number,
   H: number,
   quality: SoraRemovalQuality = 'balanced'
-): void {
-  if (bbox.width <= 0 || bbox.height <= 0) return;
+): boolean {
+  if (bbox.width <= 0 || bbox.height <= 0) return false;
   const blendCount = quality === 'high' ? MULTI_REF_BLEND + 2
     : quality === 'balanced' ? MULTI_REF_BLEND + 1
     : MULTI_REF_BLEND;
   const refs = pickReferencesForBox(references, currentTime, bbox, blendCount);
-  if (refs.length === 0) return;
+  if (refs.length === 0) return false;
 
   const bw = bbox.width;
   const bh = bbox.height;
@@ -1325,7 +1727,7 @@ function patchRegion(
   try {
     roi = ctx.getImageData(bbox.x, bbox.y, bw, bh);
   } catch {
-    return;
+    return false;
   }
 
   // Snapshot original ROI for surround sampling (pre-fill neighbors).
@@ -1336,7 +1738,7 @@ function patchRegion(
   const { hitCount, maskCoverage } = buildBrightMaskInRoi(roi, alpha, hardMask);
   // Always fill when strip prior covers the tracked ROI (even if bright hits
   // are sparse / zero — translucent text is often under the bright threshold).
-  if (hitCount === 0 && maskCoverage < 0.05) return;
+  if (hitCount === 0 && maskCoverage < 0.05) return false;
 
   if (!patchScratch.refCanvas) {
     patchScratch.refCanvas = document.createElement('canvas');
@@ -1344,7 +1746,7 @@ function patchRegion(
   }
   const refCanvas = patchScratch.refCanvas!;
   const refCtx = patchScratch.refCtx;
-  if (!refCtx) return;
+  if (!refCtx) return false;
   if (refCanvas.width !== bw || refCanvas.height !== bh) {
     refCanvas.width = bw;
     refCanvas.height = bh;
@@ -1367,11 +1769,11 @@ function patchRegion(
     if (weight < 0.08 && donors.length > 0) continue;
     donors.push({ data: new Uint8ClampedArray(donor.data), weight });
   }
-  if (donors.length === 0) return;
+  if (donors.length === 0) return false;
 
   let wSum = 0;
   for (const d of donors) wSum += d.weight;
-  if (wSum <= 0) return;
+  if (wSum <= 0) return false;
   for (const d of donors) d.weight /= wSum;
 
   const surroundR = quality === 'fast' ? Math.max(4, SURROUND_RADIUS - 2) : SURROUND_RADIUS;
@@ -1439,4 +1841,5 @@ function patchRegion(
   }
   void maskCtx;
   void W; void H;
+  return forceNuclear;
 }
