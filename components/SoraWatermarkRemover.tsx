@@ -7,9 +7,9 @@ import { useSoraWatermarkRemoval } from '../hooks/useSoraWatermarkRemoval';
 import { SoraRemovalQuality, WatermarkCoords } from '../types';
 
 const QUALITY_OPTIONS: Array<{ value: SoraRemovalQuality; label: string; description: string }> = [
-  { value: 'fast',     label: 'Fast',     description: '6 reference frames. Quickest, less robust on busy backgrounds.' },
-  { value: 'balanced', label: 'Balanced', description: '10 reference frames. Best speed-quality trade-off.' },
-  { value: 'high',     label: 'High',     description: '16 reference frames. Cleanest fill on dynamic scenes (slower).' },
+  { value: 'fast',     label: 'Fast',     description: '12 reference frames. Quickest, less robust on busy backgrounds.' },
+  { value: 'balanced', label: 'Balanced', description: '22 reference frames. Stronger mask fill + nuclear pass.' },
+  { value: 'high',     label: 'High',     description: '32 reference frames. Cleanest fill on dynamic scenes (slower).' },
 ];
 
 interface PlaybackBoxProps {
