@@ -58,11 +58,14 @@ const MASK_CLOSE_PX = 4;
 
 // Padding (in pixels at full resolution) added around each detected bbox to
 // catch soft edges, antialiasing, thin text, and slight motion between samples.
-const DEFAULT_PADDING = 34;
+const DEFAULT_PADDING = 40;
 // Extra horizontal padding — Sora text strip + @username is wider than the logo alone.
-const DEFAULT_PADDING_X_EXTRA = 28;
+const DEFAULT_PADDING_X_EXTRA = 48;
 // Extra vertical padding — handle line sits below "Sora".
-const DEFAULT_PADDING_Y_EXTRA = 14;
+const DEFAULT_PADDING_Y_EXTRA = 18;
+// Asymmetric text-side pad: cloud logo is left; "Sora" + "@handle" extend right + down.
+const TEXT_SIDE_PAD_EXTRA = 56;
+const HANDLE_LINE_PAD_EXTRA = 22;
 // Morphological close radius (work-res) before connected components — merges glyph strokes.
 const DETECT_CLOSE_PX = 5;
 // (Trajectory is piecewise-constant across slot hops; no spatial lerp.)
@@ -92,13 +95,16 @@ const SLOT_STICK_BONUS = 0.12;
 const MULTI_REF_BLEND = 5;
 
 // Soft logo+text strip prior alpha (unioned with dilated bright mask).
-const STRIP_PRIOR_PEAK = 235;
+// Peak 255 so hard-core of strip is fully opaque in pass-1 blend.
+const STRIP_PRIOR_PEAK = 255;
 // Surround-sample (Telea-like) radius in ROI pixels.
-const SURROUND_RADIUS = 7;
+const SURROUND_RADIUS = 9;
 // After first fill, if ROI bright fraction still exceeds this → nuclear box fill.
-const NUCLEAR_BRIGHT_FRAC = 0.06;
-// Outer ring (px) preserved / feathered during nuclear full-ROI paste.
-const NUCLEAR_EDGE_FEATHER = 14;
+const NUCLEAR_BRIGHT_FRAC = 0.04;
+// Outer ring (px) feathered during nuclear cover — hard core inside is alpha 1.0.
+const NUCLEAR_EDGE_FEATHER = 12;
+// Second nuclear pass if residual bright fraction still above this.
+const NUCLEAR_SECOND_PASS_FRAC = 0.012;
 
 // Residual verification: tighter thresholds + denser trajectory sampling.
 // Average ROI bright fraction above this fails; any single sample above MAX fails.
@@ -422,9 +428,11 @@ export async function removeSoraWatermark(
         try { mediaRecorder?.stop(); } catch { /* ignore */ }
         return;
       }
+      // Base layer from the live video, then patchRegion overwrites the ROI with
+      // the filled composite. captureStream records this canvas after putImageData.
       ctx.drawImage(video, 0, 0, W, H);
 
-            const t = video.currentTime;
+      const t = video.currentTime;
       const predicted = bboxAtTime(detection.trajectory, t, W, H, detection.padding);
 
       // Per-frame 9-slot dwell re-score: hold on edge/corner until evidence hops.
@@ -1214,13 +1222,27 @@ function bboxAtTime(
   return padBox(hold, padding, W, H);
 }
 
+/**
+ * Expand detected logo bbox into a wide logo+text strip ROI.
+ * Sora layout is cloud (left) + "Sora" / "@handle" (right+down) — pad the text
+ * side harder so username glyphs are never clipped by a tight logo box.
+ */
 function padBox(b: WatermarkCoords, padding: number, W: number, H: number): WatermarkCoords {
-  const padX = padding + DEFAULT_PADDING_X_EXTRA;
-  const padY = padding + DEFAULT_PADDING_Y_EXTRA;
-  const x = clamp(b.x - padX, 0, W - 1);
-  const y = clamp(b.y - padY, 0, H - 1);
-  const width = clamp(b.width + padX * 2, 1, W - x);
-  const height = clamp(b.height + padY * 2, 1, H - y);
+  const padLeft = padding + DEFAULT_PADDING_X_EXTRA;
+  const padRight = padding + DEFAULT_PADDING_X_EXTRA + TEXT_SIDE_PAD_EXTRA;
+  const padTop = padding + DEFAULT_PADDING_Y_EXTRA;
+  const padBottom = padding + DEFAULT_PADDING_Y_EXTRA + HANDLE_LINE_PAD_EXTRA;
+  // Prefer wide strip: ensure ROI aspect stays >= ~2.4 when the raw box is short.
+  let width = b.width + padLeft + padRight;
+  let height = b.height + padTop + padBottom;
+  const minW = Math.max(width, Math.round(height * 2.4));
+  const grow = Math.max(0, minW - width);
+  // Grow mostly to the text side (right); logo stays near the left of the ROI.
+  const growLeft = Math.round(grow * 0.2);
+  const x = clamp(b.x - padLeft - growLeft, 0, W - 1);
+  const y = clamp(b.y - padTop, 0, H - 1);
+  width = clamp(b.width + padLeft + padRight + grow, 1, W - x);
+  height = clamp(height, 1, H - y);
   return { x, y, width, height };
 }
 
@@ -1367,16 +1389,16 @@ function erodeBinary(src: Uint8Array, bw: number, bh: number, radius: number): U
  * this prior forces fill across the tracked strip aspect.
  */
 function softStripPriorAlpha(bw: number, bh: number, out: Uint8Array): void {
-  // Inset slightly so the outer ROI ring can still feather into scene content.
-  const insetX = Math.max(2, Math.round(bw * 0.04));
-  const insetY = Math.max(2, Math.round(bh * 0.08));
+  // Small inset so only the outer ROI ring feathers into scene content.
+  const insetX = Math.max(1, Math.round(Math.min(NUCLEAR_EDGE_FEATHER * 0.35, bw * 0.02)));
+  const insetY = Math.max(1, Math.round(Math.min(NUCLEAR_EDGE_FEATHER * 0.35, bh * 0.05)));
   const cx = (bw - 1) * 0.5;
   const cy = (bh - 1) * 0.5;
-  // Superellipse / rounded-rect radius (higher n → squarer).
+  // Superellipse / rounded-rect (higher n → squarer) covering logo+text strip.
   const rx = Math.max(1, (bw - 1) * 0.5 - insetX);
   const ry = Math.max(1, (bh - 1) * 0.5 - insetY);
-  const n = 3.2;
-  const feather = Math.max(4, Math.min(FEATHER_PIXELS + 2, Math.round(Math.min(rx, ry) * 0.35)));
+  const n = 4.0;
+  const feather = Math.max(4, Math.min(NUCLEAR_EDGE_FEATHER, Math.round(Math.min(rx, ry) * 0.28)));
   for (let y = 0; y < bh; y++) {
     for (let x = 0; x < bw; x++) {
       const nx = Math.abs(x - cx) / rx;
@@ -1384,11 +1406,15 @@ function softStripPriorAlpha(bw: number, bh: number, out: Uint8Array): void {
       const d = Math.pow(Math.pow(nx, n) + Math.pow(ny, n), 1 / n);
       let a = 0;
       if (d <= 1) {
-        // Distance-to-boundary in pixel-ish units for soft falloff.
         const distIn = (1 - d) * Math.min(rx, ry);
-        const s = clamp(distIn / feather, 0, 1);
-        const smooth = s * s * (3 - 2 * s);
-        a = Math.round(STRIP_PRIOR_PEAK * Math.max(smooth, d < 0.82 ? 1 : smooth));
+        // Hard core fully opaque; feather only near the prior boundary.
+        if (distIn >= feather) {
+          a = STRIP_PRIOR_PEAK;
+        } else {
+          const s = clamp(distIn / feather, 0, 1);
+          const smooth = s * s * (3 - 2 * s);
+          a = Math.round(STRIP_PRIOR_PEAK * smooth);
+        }
       }
       out[y * bw + x] = a;
     }
@@ -1473,8 +1499,9 @@ function buildBrightMaskInRoi(
       }
       // Ensure prior contribution even if feather of sparse binary missed a pixel.
       if (prior[i] > a) a = prior[i];
-      // Hard core of dilated bright mask stays fully on.
-      if (mask[i] && a < 220) a = Math.max(a, 220);
+      // Hard core of dilated bright mask + strip prior stays fully opaque (alpha 1.0).
+      if (mask[i]) a = 255;
+      if (prior[i] >= 250) a = 255;
       outAlpha[i] = a;
       if (hardMaskOut) hardMaskOut[i] = mask[i];
     }
@@ -1544,6 +1571,18 @@ function surroundSampleRgb(
 }
 
 /**
+ * True if a donor RGB sample looks like residual watermark (bright + low-sat).
+ * Dirty donors still carry "Sora @…" glyphs — never paste those into the hard core.
+ */
+function isBrightWatermarkSample(r: number, g: number, b: number): boolean {
+  const maxC = Math.max(r, g, b);
+  const minC = Math.min(r, g, b);
+  const sat = maxC - minC;
+  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+  return lum >= BRIGHT_THRESHOLD - 28 && sat <= LOW_SATURATION_THRESHOLD + 28;
+}
+
+/**
  * Mean RGB sampled from the ROI border ring (outside the hard mask core).
  * Used as a last-resort nuclear fill so text becomes unreadable.
  */
@@ -1562,12 +1601,31 @@ function borderMeanRgb(
       const i = y * bw + x;
       if (alpha[i] > 80) continue;
       const p = i * 4;
-      sr += data[p]; sg += data[p + 1]; sb += data[p + 2];
+      const r = data[p], g = data[p + 1], b = data[p + 2];
+      // Don't let watermark glyphs on the ring bias the cover color.
+      if (isBrightWatermarkSample(r, g, b)) continue;
+      sr += r; sg += g; sb += b;
       n++;
     }
   }
   if (n < 8) {
-    // Fallback: any border pixel regardless of alpha.
+    // Fallback: any non-watermark border pixel regardless of alpha.
+    sr = 0; sg = 0; sb = 0; n = 0;
+    for (let y = 0; y < bh; y++) {
+      for (let x = 0; x < bw; x++) {
+        const onRing = x < ring || y < ring || x >= bw - ring || y >= bh - ring;
+        if (!onRing) continue;
+        const p = (y * bw + x) * 4;
+        const r = data[p], g = data[p + 1], b = data[p + 2];
+        if (isBrightWatermarkSample(r, g, b)) continue;
+        sr += r; sg += g; sb += b;
+        n++;
+      }
+    }
+  }
+  if (n < 4) {
+    // Last resort: all ring pixels (may be slightly bright).
+    sr = 0; sg = 0; sb = 0; n = 0;
     for (let y = 0; y < bh; y++) {
       for (let x = 0; x < bw; x++) {
         const onRing = x < ring || y < ring || x >= bw - ring || y >= bh - ring;
@@ -1583,70 +1641,110 @@ function borderMeanRgb(
 }
 
 /**
- * Nuclear pass: gaussian-feathered full-ROI paste from best donor, blended with
- * border mean so translucent logo+handle text is unreadable even if imperfect.
+ * Nuclear cover: fully opaque (alpha 1.0) hard core over the entire logo+text
+ * strip; feather only the outer NUCLEAR_EDGE_FEATHER px.
+ *
+ * Prefer border-mean / clean surround as cover color. Donor pixels that still
+ * look like watermark glyphs are rejected so we never re-stamp readable text.
+ * `opaqueOnly` skips feather (second pass over residual bright clusters).
  */
 function applyNuclearFill(
   out: Uint8ClampedArray,
   donors: { data: Uint8ClampedArray; weight: number }[],
   bw: number,
   bh: number,
-  border: { r: number; g: number; b: number } | null
+  border: { r: number; g: number; b: number } | null,
+  opaqueOnly: boolean = false
 ): void {
-  // Pick strongest donor.
-  let best = donors[0];
-  for (const d of donors) {
-    if (d.weight > best.weight) best = d;
-  }
-  const feather = NUCLEAR_EDGE_FEATHER;
-  const cx = (bw - 1) * 0.5;
-  const cy = (bh - 1) * 0.5;
-  const rx = Math.max(1, bw * 0.5);
-  const ry = Math.max(1, bh * 0.5);
+  const feather = opaqueOnly ? 0 : NUCLEAR_EDGE_FEATHER;
+  const coverR = border ? border.r : 128;
+  const coverG = border ? border.g : 128;
+  const coverB = border ? border.b : 128;
+
+  // Pre-blend clean donor contribution once (weights already normalized).
+  const hasDonors = donors.length > 0;
+
   for (let y = 0; y < bh; y++) {
     for (let x = 0; x < bw; x++) {
       const edgeDist = Math.min(x, y, bw - 1 - x, bh - 1 - y);
-      let t = feather <= 0 ? 1 : clamp(edgeDist / feather, 0, 1);
-      t = t * t * (3 - 2 * t);
-      // Extra strength toward center of strip.
-      const nx = (x - cx) / rx;
-      const ny = (y - cy) / ry;
-      const radial = clamp(1 - Math.sqrt(nx * nx + ny * ny), 0, 1);
-      // Hard core of the ROI is fully covered (opacity 1); only the outer feather
-      // ring blends. White glyphs cannot remain sharp inside the tracked bbox.
-      const strength = t >= 1 ? 1 : clamp(t * (0.88 + 0.12 * radial), 0, 1);
-      if (strength < 0.02) continue;
+      let strength: number;
+      if (feather <= 0) {
+        strength = 1;
+      } else if (edgeDist >= feather) {
+        // Hard core — fully opaque. No soft center that leaves glyphs.
+        strength = 1;
+      } else {
+        const t = clamp(edgeDist / feather, 0, 1);
+        strength = t * t * (3 - 2 * t);
+      }
+      if (strength < 0.01) continue;
+
       const p = (y * bw + x) * 4;
-      let sr = best.data[p];
-      let sg = best.data[p + 1];
-      let sb = best.data[p + 2];
-      // Mix a little multi-ref + border mean so cuts don't leave a hard stamp.
-      if (donors.length > 1) {
+      let sr = coverR;
+      let sg = coverG;
+      let sb = coverB;
+
+      if (hasDonors) {
         let wr = 0, wg = 0, wb = 0, ww = 0;
         for (const d of donors) {
-          wr += d.data[p] * d.weight;
-          wg += d.data[p + 1] * d.weight;
-          wb += d.data[p + 2] * d.weight;
+          const dr = d.data[p];
+          const dg = d.data[p + 1];
+          const db = d.data[p + 2];
+          // Skip watermark-looking donor samples — they reintroduce readable text.
+          if (isBrightWatermarkSample(dr, dg, db)) continue;
+          wr += dr * d.weight;
+          wg += dg * d.weight;
+          wb += db * d.weight;
           ww += d.weight;
         }
-        if (ww > 0) {
-          sr = sr * 0.45 + (wr / ww) * 0.55;
-          sg = sg * 0.45 + (wg / ww) * 0.55;
-          sb = sb * 0.45 + (wb / ww) * 0.55;
+        if (ww > 0.05) {
+          // Mostly donor scene, lightly anchored to border mean for continuity.
+          const u = border ? 0.82 : 1;
+          sr = (wr / ww) * u + coverR * (1 - u);
+          sg = (wg / ww) * u + coverG * (1 - u);
+          sb = (wb / ww) * u + coverB * (1 - u);
         }
+        // else: keep pure border/cover — safer than stamping dirty glyphs
       }
-      if (border) {
-        sr = sr * 0.72 + border.r * 0.28;
-        sg = sg * 0.72 + border.g * 0.28;
-        sb = sb * 0.72 + border.b * 0.28;
+
+      if (strength >= 0.999) {
+        out[p] = Math.round(sr);
+        out[p + 1] = Math.round(sg);
+        out[p + 2] = Math.round(sb);
+      } else {
+        out[p]     = Math.round(sr * strength + out[p] * (1 - strength));
+        out[p + 1] = Math.round(sg * strength + out[p + 1] * (1 - strength));
+        out[p + 2] = Math.round(sb * strength + out[p + 2] * (1 - strength));
       }
-      out[p]     = Math.round(sr * strength + out[p] * (1 - strength));
-      out[p + 1] = Math.round(sg * strength + out[p + 1] * (1 - strength));
-      out[p + 2] = Math.round(sb * strength + out[p + 2] * (1 - strength));
     }
   }
 }
 
+/**
+ * Second-pass kill: fully opaque replace of residual bright/low-sat pixels
+ * (dilated) with border cover color. Leaves non-bright scene pixels alone.
+ */
+function applyResidualOpaqueKill(
+  out: Uint8ClampedArray,
+  bw: number,
+  bh: number,
+  border: { r: number; g: number; b: number } | null
+): void {
+  const coverR = border ? border.r : 128;
+  const coverG = border ? border.g : 128;
+  const coverB = border ? border.b : 128;
+  const hit = new Uint8Array(bw * bh);
+  for (let i = 0, p = 0; i < bw * bh; i++, p += 4) {
+    if (isBrightWatermarkSample(out[p], out[p + 1], out[p + 2])) hit[i] = 1;
+  }
+  const dilated = dilateBinary(hit, bw, bh, 3);
+  for (let i = 0, p = 0; i < bw * bh; i++, p += 4) {
+    if (!dilated[i]) continue;
+    out[p] = Math.round(coverR);
+    out[p + 1] = Math.round(coverG);
+    out[p + 2] = Math.round(coverB);
+  }
+}
 
 /**
  * Re-detect the watermark inside a search window around the predicted bbox.
@@ -1776,33 +1874,44 @@ function patchRegion(
   if (wSum <= 0) return false;
   for (const d of donors) d.weight /= wSum;
 
-  const surroundR = quality === 'fast' ? Math.max(4, SURROUND_RADIUS - 2) : SURROUND_RADIUS;
+  const surroundR = quality === 'fast' ? Math.max(5, SURROUND_RADIUS - 2) : SURROUND_RADIUS;
   const out = roi.data;
 
-  // Pass 1: surround-sample (current frame) preferentially + multi-ref blend.
+  // Pass (a): Telea-like surround inpaint + multi-ref blend under soft/hard mask.
+  // Reject donor samples that still look like watermark glyphs.
   for (let i = 0, p = 0; i < bw * bh; i++, p += 4) {
     const a = alpha[i];
     if (a === 0) continue;
     const x = i % bw;
     const y = (i / bw) | 0;
 
-    let sr = 0, sg = 0, sb = 0;
+    let sr = 0, sg = 0, sb = 0, swD = 0;
     for (const d of donors) {
-      sr += d.data[p] * d.weight;
-      sg += d.data[p + 1] * d.weight;
-      sb += d.data[p + 2] * d.weight;
+      const dr = d.data[p], dg = d.data[p + 1], db = d.data[p + 2];
+      if (isBrightWatermarkSample(dr, dg, db)) continue;
+      sr += dr * d.weight;
+      sg += dg * d.weight;
+      sb += db * d.weight;
+      swD += d.weight;
+    }
+    if (swD > 0) {
+      sr /= swD; sg /= swD; sb /= swD;
+    } else {
+      // No clean donor at this pixel — seed from current (will be overwritten by nuclear).
+      sr = out[p]; sg = out[p + 1]; sb = out[p + 2];
     }
 
     const surround = surroundSampleRgb(original, alpha, x, y, bw, bh, surroundR, hardMask);
     if (surround) {
       // Prefer local surround when available — matches lighting/grain better.
-      const sw = clamp(surround.w / (surround.w + 4), 0.35, 0.85);
+      const sw = clamp(surround.w / (surround.w + 4), 0.45, 0.92);
       sr = surround.r * sw + sr * (1 - sw);
       sg = surround.g * sw + sg * (1 - sw);
       sb = surround.b * sw + sb * (1 - sw);
     }
 
-    if (a === 255) {
+    if (a >= 250) {
+      // Hard core of mask: fully replace (alpha 1.0) — no glyph bleed-through.
       out[p] = Math.round(sr);
       out[p + 1] = Math.round(sg);
       out[p + 2] = Math.round(sb);
@@ -1814,25 +1923,41 @@ function patchRegion(
     out[p + 2] = Math.round(sb * t + out[p + 2] * (1 - t));
   }
 
-  // Pass 2 (nuclear): if bright residual in ROI still high, force feathered
-  // full-bbox fill so logo+handle text is unreadable.
+  // Pass (b): opaque donor/border nuclear cover over hard core of full ROI strip.
   const residualFrac = brightFractionInRoi(roi);
   const nuclearThresh = quality === 'high'
     ? NUCLEAR_BRIGHT_FRAC * 0.7
     : quality === 'fast'
       ? NUCLEAR_BRIGHT_FRAC * 1.35
       : NUCLEAR_BRIGHT_FRAC;
-  // Nuclear when residual bright fraction stays high after surround+donor fill,
-  // or always (moderated) on balanced/high — sparse bright masks leave readable text.
+  // Always nuclear on balanced/high — soft Telea alone leaves readable @handle text.
   const forceNuclear =
     residualFrac >= nuclearThresh ||
     (hitCount >= 8 && residualFrac >= nuclearThresh * 0.45) ||
     quality !== 'fast';
+  const border = borderMeanRgb(
+    original, alpha, bw, bh,
+    Math.max(3, Math.round(Math.min(bw, bh) * 0.1))
+  );
   if (forceNuclear) {
-    const border = borderMeanRgb(original, alpha, bw, bh, Math.max(2, Math.round(Math.min(bw, bh) * 0.08)));
-    applyNuclearFill(out, donors, bw, bh, border);
+    applyNuclearFill(out, donors, bw, bh, border, false);
   }
 
+  // Pass (c): if residual bright cluster remains, opaque-cover those pixels only
+  // (plus a small dilate) so glyphs die without a hard full-ROI stamp.
+  if (forceNuclear) {
+    const afterFrac = brightFractionInRoi(roi);
+    const cluster = largestBrightClusterInRoi(roi);
+    const needsSecond =
+      afterFrac >= NUCLEAR_SECOND_PASS_FRAC ||
+      (cluster !== null && clusterMatchesLogoTextPrior(cluster));
+    if (needsSecond) {
+      applyResidualOpaqueKill(out, bw, bh, border);
+    }
+  }
+
+  // Draw order: write the filled ROI back onto the recording canvas. MediaRecorder
+  // captures this canvas — never leave the original video underlay as the top layer.
   ctx.putImageData(roi, bbox.x, bbox.y);
 
   if (maskCanvas.width !== bw || maskCanvas.height !== bh) {
