@@ -79,10 +79,14 @@ const CORNER_DRIFT_PAD_PX = 8;
 // Extra opaque-cover inset beyond padded bbox (catches AA / breathing edges).
 const OPAQUE_COVER_EXTRA_PX = 6;
 // Always-on multi-corner cover — removal must not depend on single-slot pick.
-// Forensic strip: height ≈ 3.5% H; width ≈ 2.2–2.8× height; ≥8px micro-drift pad.
-const ALWAYS_ON_COVER_WIDTH_MULT = 2.6;
+// Measured on stealth-source.mp4 (1280×704) @1/2/4/6/8s: mark ≈14–16%W × 9–10%H,
+// typically inset ~4–8% from the frame edge (not flush). Old 3.5%H×~5%W ROIs
+// missed the strip entirely (readable residual ~100%). Size to measured + margin.
+const ALWAYS_ON_COVER_WIDTH_FRAC = 0.19;  // ≥ measured ~15–16%W + margin
+const ALWAYS_ON_COVER_HEIGHT_FRAC = 0.15; // ≥ measured ~9–10%H + margin
 const ALWAYS_ON_INCLUDE_MID_EDGES = true; // ML/MR/TC/BC — still cheap vs 9-slot morph
-const ALWAYS_ON_EDGE_INSET_PX = CORNER_DRIFT_PAD_PX; // ≥8px from frame edge
+// Inset from true corner/edge so ROI overlaps mark origin (~4–8%) + micro-drift.
+const ALWAYS_ON_EDGE_INSET_FRAC = 0.020; // ~2% — expandBox pulls to edge; keeps ROI on ~4–8% mark origin
 // Morphological close radius (work-res) before connected components — merges glyph strokes.
 const DETECT_CLOSE_PX = 5;
 // (Trajectory is piecewise-constant across slot hops; no spatial lerp.)
@@ -1435,7 +1439,8 @@ function expandBoxForDrift(b: WatermarkCoords, W: number, H: number): WatermarkC
 
 /**
  * Fixed forensic ROIs for always-on cover: TL/TR/BL/BR (+ optional mid-edges).
- * Size from MARK_HEIGHT_FRAC × width mult; inset ≥8px for corner micro-drift.
+ * Sized from measured mark (~14–16%W × 9–10%H) + margin; inset from true
+ * corners/edges so the ROI overlaps mark origin (~4–8%) and handle text.
  * Removal paints all of these every frame — no single-slot dependency.
  */
 function buildAlwaysOnCoverRois(
@@ -1443,9 +1448,11 @@ function buildAlwaysOnCoverRois(
   H: number,
   includeMidEdges: boolean = ALWAYS_ON_INCLUDE_MID_EDGES
 ): WatermarkCoords[] {
-  const markH = Math.max(10, Math.round(H * MARK_HEIGHT_FRAC));
-  const markW = Math.max(markH + 8, Math.round(markH * ALWAYS_ON_COVER_WIDTH_MULT));
-  const inset = Math.max(8, ALWAYS_ON_EDGE_INSET_PX);
+  const markH = Math.max(24, Math.round(H * ALWAYS_ON_COVER_HEIGHT_FRAC));
+  const markW = Math.max(markH + 16, Math.round(W * ALWAYS_ON_COVER_WIDTH_FRAC));
+  // Axis-aware inset: enough to sit on the measured mark origin, not flush 8px.
+  const insetX = Math.max(12, Math.round(W * ALWAYS_ON_EDGE_INSET_FRAC));
+  const insetY = Math.max(12, Math.round(H * ALWAYS_ON_EDGE_INSET_FRAC));
   const rois: WatermarkCoords[] = [];
   const place = (x: number, y: number) => {
     const raw = clampBox(
@@ -1454,17 +1461,17 @@ function buildAlwaysOnCoverRois(
     );
     rois.push(expandBoxForDrift(raw, W, H));
   };
-  place(inset, inset);                               // TL
-  place(W - markW - inset, inset);                   // TR
-  place(inset, H - markH - inset);                   // BL
-  place(W - markW - inset, H - markH - inset);       // BR
+  place(insetX, insetY);                               // TL
+  place(W - markW - insetX, insetY);                   // TR
+  place(insetX, H - markH - insetY);                   // BL
+  place(W - markW - insetX, H - markH - insetY);       // BR
   if (includeMidEdges) {
     const mx = Math.round((W - markW) / 2);
     const my = Math.round((H - markH) / 2);
-    place(mx, inset);                                // TC
-    place(mx, H - markH - inset);                    // BC
-    place(inset, my);                                // ML
-    place(W - markW - inset, my);                    // MR
+    place(mx, insetY);                                 // TC
+    place(mx, H - markH - insetY);                     // BC
+    place(insetX, my);                                 // ML
+    place(W - markW - insetX, my);                     // MR
   }
   return rois;
 }
@@ -1999,16 +2006,16 @@ function fastOpaqueCover(
   const bh = box.height;
   const original = roi.data;
   const alpha = new Uint8ClampedArray(bw * bh);
-  // Soft strip prior only — no dilate/close (too expensive for every RAF).
-  const prior = new Uint8Array(bw * bh);
-  softStripPriorAlpha(bw, bh, prior);
-  for (let i = 0; i < bw * bh; i++) alpha[i] = prior[i];
+  // Rectangular hard-core prior (fully opaque) — ellipse soft prior left
+  // readable glyphs in the ROI corners of wide logo+handle strips.
+  hardRectPriorAlpha(bw, bh, alpha);
 
   const border = borderMeanRgb(
     original, alpha, bw, bh,
-    Math.max(2, Math.round(Math.min(bw, bh) * 0.1))
+    Math.max(2, Math.round(Math.min(bw, bh) * 0.08))
   );
-  applyNuclearFill(original, [], bw, bh, border, false);
+  // Primary pass fully opaque across the hard core (no soft center).
+  applyNuclearFill(original, [], bw, bh, border, true);
   applyResidualOpaqueKill(original, bw, bh, border);
   const afterFrac = brightFractionInRoi(roi);
   if (afterFrac >= NUCLEAR_SECOND_PASS_FRAC) {
@@ -2017,6 +2024,27 @@ function fastOpaqueCover(
   }
   ctx.putImageData(roi, box.x, box.y);
   return true;
+}
+
+/**
+ * Fully opaque rectangular prior for always-on covers. Only a thin outer ring
+ * feathers; the hard core is alpha 255 so logo+handle glyphs cannot survive.
+ */
+function hardRectPriorAlpha(bw: number, bh: number, out: Uint8ClampedArray | Uint8Array): void {
+  const feather = Math.max(2, Math.min(NUCLEAR_EDGE_FEATHER, Math.round(Math.min(bw, bh) * 0.06)));
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const edgeDist = Math.min(x, y, bw - 1 - x, bh - 1 - y);
+      let a: number;
+      if (edgeDist >= feather) {
+        a = 255; // hard core — fully opaque
+      } else {
+        const t = edgeDist / feather;
+        a = Math.round(255 * t * t * (3 - 2 * t));
+      }
+      out[y * bw + x] = a;
+    }
+  }
 }
 
 function snapBboxToLocalBright(
