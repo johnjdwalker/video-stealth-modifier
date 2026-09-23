@@ -23,7 +23,14 @@ export interface VideoSettings {
   // Geometry / overlays
   flipHorizontal: boolean; // True to flip video horizontally.
   enableRotatingLines: boolean; // True to add rotating lines effect.
-  enablePixelNoise: boolean; // True to add subtle pixel noise.
+  enablePixelNoise: boolean; // True to add subtle salt/pepper pixel noise.
+  /** Soft film-like grain intensity 0-100 (preferred over salt/pepper for stealth). */
+  softGrain: number;
+  /**
+   * Micro-crop / slight scale as percent of the shorter side (0-5).
+   * Zooms in by this amount so edges are cropped — useful for stealth rematching.
+   */
+  cropZoomPercent: number;
 
   // Trimming (in seconds, relative to source video). Use null/undefined to mean "from start" / "to end".
   trimStartSeconds: number | null;
@@ -61,6 +68,7 @@ export interface WatermarkRemovalState {
   progress: number; // 0-100
   error: string | null;
   processedVideoUrl: string | null;
+  processedBlob: Blob | null;
 }
 
 // ----------------------------------------------------------------------------
@@ -110,6 +118,11 @@ export interface SoraRemovalState {
   error: string | null;
   processedVideoUrl: string | null;
   processedMimeType: string | null;
+  /** Raw cleaned blob for handoff to Modifier. */
+  processedBlob: Blob | null;
+  /** Residual bright-pixel check on cleaned output. null until removal finishes. */
+  residualPassed: boolean | null;
+  residualFraction: number | null;
 }
 
 // DEFAULT_VIDEO_SETTINGS is defined and exported from constants.ts

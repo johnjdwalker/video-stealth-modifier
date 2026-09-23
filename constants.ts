@@ -17,6 +17,8 @@ export const DEFAULT_VIDEO_SETTINGS: VideoSettings = {
   flipHorizontal: false,
   enableRotatingLines: false,
   enablePixelNoise: false,
+  softGrain: 0,
+  cropZoomPercent: 0,
   trimStartSeconds: null,
   trimEndSeconds: null,
   outputFormat: 'webm-vp8',
@@ -55,6 +57,8 @@ export const SETTINGS_RANGES = {
   audioFadeInSeconds: { min: 0, max: 10 },
   audioFadeOutSeconds: { min: 0, max: 10 },
   outputBitrateKbps: { min: 0, max: 50000 },
+  softGrain: { min: 0, max: 100 },
+  cropZoomPercent: { min: 0, max: 5 },
 } as const;
 
 // Settings presets for quick application
@@ -65,7 +69,20 @@ export const SETTINGS_PRESETS: Record<string, VideoSettings> = {
     brightness: 105,
     contrast: 102,
     saturation: 98,
-    enablePixelNoise: true,
+    enablePixelNoise: false,
+    softGrain: 12,
+    enableRotatingLines: false,
+  },
+  stealth: {
+    ...DEFAULT_VIDEO_SETTINGS,
+    brightness: 101,
+    contrast: 101,
+    saturation: 103,
+    hueRotate: 2,
+    softGrain: 18,
+    cropZoomPercent: 1.2,
+    enablePixelNoise: false,
+    enableRotatingLines: false,
   },
   vintage: {
     ...DEFAULT_VIDEO_SETTINGS,
@@ -126,7 +143,8 @@ export const SETTINGS_PRESETS: Record<string, VideoSettings> = {
 
 export const PRESET_DESCRIPTIONS: Record<string, string> = {
   default: 'Original settings with no modifications',
-  subtle: 'Barely noticeable changes with minimal pixel noise',
+  subtle: 'Barely noticeable changes with soft grain (no rotating lines)',
+  stealth: 'Micro-crop (~1.2%), soft grain, tiny hue/sat shift — no rotating lines',
   vintage: 'Old film look: sepia, lower saturation, slight vignette',
   dramatic: 'High contrast and brightness with rotating lines',
   cinematic: 'Film-like quality with reduced saturation, slow pace, vignette',

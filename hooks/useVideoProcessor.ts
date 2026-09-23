@@ -366,17 +366,50 @@ export function useVideoProcessor() {
             return;
           }
 
+          const cw = canvasRef.current.width;
+          const ch = canvasRef.current.height;
+          const zoomPct = Math.max(0, Math.min(5, settings.cropZoomPercent || 0));
+          // Micro-crop via slight scale: zoomPct% of frame is cropped from edges.
+          const scale = zoomPct > 0 ? 1 + zoomPct / 100 : 1;
+          const srcW = cw / scale;
+          const srcH = ch / scale;
+          const sx = (cw - srcW) / 2;
+          const sy = (ch - srcH) / 2;
+
           ctx.save();
           if (settings.flipHorizontal) {
-            ctx.translate(canvasRef.current.width, 0);
+            ctx.translate(cw, 0);
             ctx.scale(-1, 1);
           }
           ctx.filter = baseFilter;
-          ctx.drawImage(sourceVideoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
+          if (scale > 1) {
+            ctx.drawImage(
+              sourceVideoRef.current,
+              sx, sy, srcW, srcH,
+              0, 0, cw, ch
+            );
+          } else {
+            ctx.drawImage(sourceVideoRef.current, 0, 0, cw, ch);
+          }
           ctx.restore();
 
           // Reset filter for overlays that should not be filtered.
           ctx.filter = 'none';
+
+          // Soft film grain (preferred for stealth) - low-amplitude luminance noise.
+          if ((settings.softGrain || 0) > 0 && canvasRef.current) {
+            const intensity = Math.max(0, Math.min(100, settings.softGrain)) / 100;
+            const grainPixels = Math.floor(cw * ch * (0.004 + intensity * 0.012));
+            for (let i = 0; i < grainPixels; i++) {
+              const x = Math.random() * cw;
+              const y = Math.random() * ch;
+              const delta = (Math.random() - 0.5) * 40 * intensity;
+              const alpha = 0.04 + intensity * 0.08;
+              const v = Math.max(0, Math.min(255, 128 + delta));
+              ctx.fillStyle = `rgba(${v}, ${v}, ${v}, ${alpha})`;
+              ctx.fillRect(x, y, 1 + (Math.random() > 0.7 ? 1 : 0), 1);
+            }
+          }
 
           if (settings.enablePixelNoise && canvasRef.current) {
             const currentCanvas = canvasRef.current;

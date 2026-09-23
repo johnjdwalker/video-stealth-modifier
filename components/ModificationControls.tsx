@@ -507,11 +507,33 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
         <ToggleRow
           id="enablePixelNoise"
           label="Pixel Noise"
-          description="Adds subtle random pixel noise. Effect in processed video."
+          description="Salt/pepper pixels. Prefer Soft Grain for stealth."
           checked={settings.enablePixelNoise}
           onChange={(v) => updateBool('enablePixelNoise', v)}
           disabled={commonDisabledState}
         />
+        <SliderControl
+          label="Soft Grain"
+          id="softGrain"
+          value={settings.softGrain}
+          min={0} max={100} step={1} unit="%"
+          onChange={(v) => updateNumber('softGrain', v)}
+          disabled={commonDisabledState}
+        />
+        <p className="text-xs text-gray-400 mb-3">
+          Soft film-like luminance grain. Better for stealth than salt/pepper noise.
+        </p>
+        <SliderControl
+          label="Micro-crop / Zoom"
+          id="cropZoomPercent"
+          value={settings.cropZoomPercent}
+          min={0} max={5} step={0.1} unit="%"
+          onChange={(v) => updateNumber('cropZoomPercent', v)}
+          disabled={commonDisabledState}
+        />
+        <p className="text-xs text-gray-400 mb-3">
+          Slight scale-in that crops edges (~0.5-2% recommended for stealth). Applied in processed video.
+        </p>
         <ToggleRow
           id="audioPreservesPitch"
           label="Preserve Audio Pitch"

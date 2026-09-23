@@ -256,12 +256,31 @@ const App: React.FC = () => {
   };
 
   const switchFeatureMode = (mode: FeatureMode) => {
+    // Keep the current video across feature modes unless the user explicitly clears it.
     setFeatureMode(mode);
-    setVideoFile(null);
     setProcessedVideoUrl(null);
     setGeminiError(null);
     setFileError(null);
-    setVideoDuration(undefined);
+  };
+
+  /** Hand cleaned output from watermark removers into the Modifier pipeline. */
+  const handleUseInModifier = (file: File) => {
+    setVideoFile(file);
+    setFeatureMode('modify');
+    setProcessedVideoUrl(null);
+    setGeminiError(null);
+    setFileError(null);
+    setCurrentSettings((prev) => ({ ...prev, trimStartSeconds: null, trimEndSeconds: null }));
+
+    const video = document.createElement('video');
+    const probeUrl = URL.createObjectURL(file);
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      if (isFinite(video.duration)) setVideoDuration(video.duration);
+      URL.revokeObjectURL(probeUrl);
+    };
+    video.onerror = () => URL.revokeObjectURL(probeUrl);
+    video.src = probeUrl;
   };
 
   const handleUploadDifferent = () => {
@@ -451,9 +470,23 @@ Based on the user's request, provide the JSON settings object as instructed.`;
 
       <main className="w-full max-w-5xl">
         {featureMode === 'sora' ? (
-          <SoraWatermarkRemover />
+          <SoraWatermarkRemover
+            videoFile={videoFile}
+            onVideoFileChange={handleFileSelect}
+            onClearVideo={handleUploadDifferent}
+            onUseInModifier={handleUseInModifier}
+            videoDuration={videoDuration}
+            onVideoDuration={setVideoDuration}
+          />
         ) : featureMode === 'watermark' ? (
-          <WatermarkRemover />
+          <WatermarkRemover
+            videoFile={videoFile}
+            onVideoFileChange={handleFileSelect}
+            onClearVideo={handleUploadDifferent}
+            onUseInModifier={handleUseInModifier}
+            videoDuration={videoDuration}
+            onVideoDuration={setVideoDuration}
+          />
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
             <div className="lg:col-span-2 space-y-6">
