@@ -114,3 +114,31 @@ export interface SoraRemovalState {
 
 // DEFAULT_VIDEO_SETTINGS is defined and exported from constants.ts
 // and should be imported from there if needed.
+
+// ----------------------------------------------------------------------------
+// Multi-clip timeline types
+// ----------------------------------------------------------------------------
+
+/**
+ * One clip on the multi-clip timeline.
+ *
+ * The File is kept in memory only (never serialized). Trim points are in
+ * source-media seconds. Global VideoSettings apply to every clip — per-clip
+ * trim is the v1 per-clip control; per-clip effects are a future milestone.
+ */
+export interface TimelineClip {
+  /** Stable id (never reused, survives reorder/split). */
+  id: string;
+  file: File;
+  name: string;
+  /** Probed source duration in seconds. */
+  duration: number;
+  /** Probed source dimensions in px (letterbox fit + thumbnails). */
+  width: number;
+  height: number;
+  /** Per-clip in/out points in source seconds. null = start/end of source. */
+  trimStart: number | null;
+  trimEnd: number | null;
+  /** Small poster thumbnail (data URL) captured while probing, if available. */
+  thumbnail: string | null;
+}
