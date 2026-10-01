@@ -12,12 +12,37 @@ interface ComparePlayersProps {
 const SYNC_DRIFT_THRESHOLD_SECONDS = 0.25;
 /** Master time is polled at this rate to keep the two players aligned. */
 const SYNC_CHECK_INTERVAL_MS = 500;
+/** How long to wait for enough preview data before giving up. */
+const PREVIEW_READY_TIMEOUT_MS = 10000;
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return '0:00';
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Resolve once the element has enough data to play (readyState >= 3).
+ * Starting playback before this risks a stalled first frame with no error.
+ */
+function ensurePreviewReady(v: HTMLVideoElement): Promise<void> {
+  if (v.readyState >= 3) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      v.removeEventListener('canplay', onCanPlay);
+      v.removeEventListener('error', onError);
+    };
+    const onCanPlay = () => { cleanup(); resolve(); };
+    const onError = () => { cleanup(); reject(new Error('The preview video could not be loaded.')); };
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error('Timed out waiting for the preview video to load.'));
+    }, PREVIEW_READY_TIMEOUT_MS);
+    v.addEventListener('canplay', onCanPlay);
+    v.addEventListener('error', onError);
+  });
 }
 
 /**
@@ -47,6 +72,20 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
   const [isPlaying, setIsPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
   const [showExportOnlyBadge, setShowExportOnlyBadge] = useState(false);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const [playError, setPlayError] = useState<string | null>(null);
+  const scrubRafRef = useRef(0);
+  const lastShownTimeRef = useRef(-1);
+
+  // React doesn't reliably set the muted *property* from the JSX attribute
+  // (it's the property that matters for autoplay policy), so set it
+  // imperatively on mount. The original stays muted to avoid doubling audio.
+  useEffect(() => {
+    const a = originalRef.current;
+    const b = modifiedRef.current;
+    if (a) a.muted = true;
+    if (b) b.muted = true;
+  }, []);
 
   // Apply per-frame-agnostic properties to the modified player.
   useEffect(() => {
@@ -60,8 +99,9 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
 
   // Pixel-noise preview overlay: re-render a low-res noise field a few times
   // per second. Cheap (160x90 = 14k px) and looks like the export effect.
+  // Only runs while playing, and skips frames while the tab is hidden.
   useEffect(() => {
-    if (!settings.enablePixelNoise) return;
+    if (!settings.enablePixelNoise || !isPlaying) return;
     const canvas = noiseCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -69,6 +109,7 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
     const w = canvas.width;
     const h = canvas.height;
     const render = () => {
+      if (document.hidden) return;
       const img = ctx.createImageData(w, h);
       for (let i = 0; i < img.data.length; i += 4) {
         const v = Math.random() > 0.5 ? 235 : 20;
@@ -82,12 +123,15 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
     render();
     const id = window.setInterval(render, 150);
     return () => window.clearInterval(id);
-  }, [settings.enablePixelNoise]);
+  }, [settings.enablePixelNoise, isPlaying]);
 
-  // Drift watcher: modified may play at a different rate (speed change), so
-  // re-snap it to the original's clock when it drifts past the threshold.
+  // Drift watcher: re-snap the modified player to the original's clock when
+  // it drifts past the threshold. Disabled while the preview runs at a
+  // different speed — slow-mo/fast-forward diverge on purpose, and
+  // re-snapping would fight the speed effect.
   useEffect(() => {
     if (!isPlaying) return;
+    if (settings.playbackSpeed !== 1) return;
     const id = window.setInterval(() => {
       const a = originalRef.current;
       const b = modifiedRef.current;
@@ -97,7 +141,24 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
       }
     }, SYNC_CHECK_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [isPlaying]);
+  }, [isPlaying, settings.playbackSpeed]);
+
+  // While scrubbing (usually paused), timeupdate doesn't fire, so the time
+  // display would lag the slider. Drive it off rAF instead, throttled to
+  // changes bigger than one frame at 30fps to avoid re-render churn.
+  useEffect(() => {
+    if (!isScrubbing) return;
+    const tick = () => {
+      const a = originalRef.current;
+      if (a && Math.abs(a.currentTime - lastShownTimeRef.current) > 1 / 30) {
+        lastShownTimeRef.current = a.currentTime;
+        setCurrentTime(a.currentTime);
+      }
+      scrubRafRef.current = requestAnimationFrame(tick);
+    };
+    scrubRafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(scrubRafRef.current);
+  }, [isScrubbing]);
 
   const handleLoadedMetadata = useCallback(() => {
     const a = originalRef.current;
@@ -108,8 +169,12 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
     const a = originalRef.current;
     const b = modifiedRef.current;
     if (!a || !b) return;
+    setPlayError(null);
     try {
       if (a.paused) {
+        // Wait for enough data before starting: playing too early stalls on
+        // the first frame with no error to show for it.
+        await Promise.all([ensurePreviewReady(a), ensurePreviewReady(b)]);
         b.currentTime = a.currentTime; // re-snap on play
         await Promise.all([a.play(), b.play()]);
         setIsPlaying(true);
@@ -118,8 +183,14 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
         b.pause();
         setIsPlaying(false);
       }
-    } catch {
-      /* play() can reject when interrupted; state stays consistent */
+    } catch (e) {
+      // play() rejects when the browser blocks it or a newer play/pause call
+      // interrupts it. The interrupt case (AbortError, from fast toggling)
+      // is expected — only surface real failures.
+      setIsPlaying(false);
+      if (e instanceof Error && e.name !== 'AbortError') {
+        setPlayError(`Could not start preview playback: ${e.message}`);
+      }
     }
   }, []);
 
@@ -269,6 +340,9 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
           step={0.05}
           value={Math.min(currentTime, duration || 0)}
           onChange={(e) => seek(Number(e.target.value))}
+          onPointerDown={() => setIsScrubbing(true)}
+          onPointerUp={() => setIsScrubbing(false)}
+          onPointerCancel={() => setIsScrubbing(false)}
           disabled={disabled || !duration}
           className="flex-1 min-w-[120px] accent-indigo-500"
           aria-label="Seek both previews"
@@ -303,6 +377,11 @@ const ComparePlayers: React.FC<ComparePlayersProps> = ({ src, settings, disabled
         Tip: focus this panel and use <kbd className="px-1 bg-gray-700 rounded">Space</kbd> to play/pause,{' '}
         <kbd className="px-1 bg-gray-700 rounded">←</kbd>/<kbd className="px-1 bg-gray-700 rounded">→</kbd> to seek 5s.
       </p>
+      {playError && (
+        <p className="text-xs text-red-400 mt-2" role="alert">
+          {playError}
+        </p>
+      )}
     </div>
   );
 };

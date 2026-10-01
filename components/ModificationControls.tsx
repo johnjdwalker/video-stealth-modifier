@@ -238,36 +238,43 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
     setPresetMessage(`Preset "${name}" deleted.`);
   };
 
-  const copyTextToClipboard = async (text: string): Promise<boolean> => {
+  /** Synchronous execCommand fallback for the share-link copy. */
+  const legacyCopyToClipboard = (text: string): boolean => {
     try {
-      await navigator.clipboard.writeText(text);
-      return true;
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return ok;
     } catch {
-      // Fallback for browsers without async clipboard permission.
-      try {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        const ok = document.execCommand('copy');
-        document.body.removeChild(textarea);
-        return ok;
-      } catch {
-        return false;
-      }
+      return false;
     }
   };
 
-  const handleCopyShareLink = async () => {
+  const handleCopyShareLink = () => {
     const url = buildPresetShareUrl(settings);
-    const ok = await copyTextToClipboard(url);
-    setShareMessage(
-      ok
-        ? 'Share link copied! Anyone opening it can apply these exact settings.'
-        : 'Could not copy automatically — your browser blocked clipboard access.'
-    );
+    const done = (ok: boolean) =>
+      setShareMessage(
+        ok
+          ? 'Share link copied! Anyone opening it can apply these exact settings.'
+          : 'Could not copy automatically — your browser blocked clipboard access.'
+      );
+    // writeText must be called synchronously inside the click handler: any
+    // await before it surrenders the user gesture and Safari/Firefox reject
+    // the write. The promise is observed without awaiting.
+    try {
+      const pending = navigator.clipboard.writeText(url);
+      Promise.resolve(pending).then(
+        () => done(true),
+        () => done(legacyCopyToClipboard(url))
+      );
+    } catch {
+      done(legacyCopyToClipboard(url));
+    }
   };
 
   const handleDownloadPreset = () => {
@@ -279,7 +286,9 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    // Revoke on a delay, not immediately: revoking before the browser has
+    // grabbed the download breaks it in some browsers.
+    window.setTimeout(() => URL.revokeObjectURL(url), 5000);
     setShareMessage('Preset file downloaded.');
   };
 

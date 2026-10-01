@@ -1,12 +1,11 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { VideoSettings } from './types';
 import {
   DEFAULT_VIDEO_SETTINGS,
   APP_TITLE,
   SETTINGS_STORAGE_KEY,
-  SETTINGS_RANGES,
   OUTPUT_FORMAT_EXTENSIONS,
 } from './constants';
 import VideoUploader from './components/VideoUploader';
@@ -17,7 +16,7 @@ import WatermarkRemover from './components/WatermarkRemover';
 import SoraWatermarkRemover from './components/SoraWatermarkRemover';
 import { useVideoProcessor } from './hooks/useVideoProcessor';
 import { useSettingsHistory } from './hooks/useSettingsHistory';
-import { clearPresetShareFromLocation, readPresetShareFromLocation } from './utils/presetSharing';
+import { clearPresetShareFromLocation, readPresetShareFromLocation, sanitizeSettings } from './utils/presetSharing';
 import { detectSilences, SilenceRegion } from './utils/silenceDetection';
 import DownloadIcon from './components/icons/DownloadIcon';
 import ProcessingSpinnerIcon from './components/icons/ProcessingSpinnerIcon';
@@ -65,7 +64,34 @@ const App: React.FC = () => {
     redo: redoSettings,
     canUndo: canUndoSettings,
     canRedo: canRedoSettings,
+    flushTransient: flushTransientSettings,
+    resetHistory: resetSettingsHistory,
   } = useSettingsHistory(loadInitialSettings);
+
+  // Monotonic ids so late async responses can be recognized as stale: the AI
+  // suggestion id is bumped on every new request, file change, and feature
+  // mode switch; the silence-detection id on every new detection and file
+  // change. A response whose id no longer matches is discarded.
+  const aiRequestIdRef = useRef(0);
+  const silenceDetectGenRef = useRef(0);
+  const silenceDetectAbortRef = useRef<AbortController | null>(null);
+
+  // Flush a pending slider-gesture undo entry the moment the gesture ends
+  // (pointer released anywhere, window blurred, key released) instead of
+  // waiting for the inactivity timer — so Ctrl+Z right after a drag works.
+  const flushTransientRef = useRef(flushTransientSettings);
+  flushTransientRef.current = flushTransientSettings;
+  useEffect(() => {
+    const flush = () => flushTransientRef.current();
+    window.addEventListener('pointerup', flush);
+    window.addEventListener('blur', flush);
+    window.addEventListener('keyup', flush);
+    return () => {
+      window.removeEventListener('pointerup', flush);
+      window.removeEventListener('blur', flush);
+      window.removeEventListener('keyup', flush);
+    };
+  }, []);
 
   const [debouncedSettingsForPreview, setDebouncedSettingsForPreview] = useState<VideoSettings>(currentSettings);
   
@@ -94,9 +120,18 @@ const App: React.FC = () => {
   const [skipSilences, setSkipSilences] = useState<boolean>(true);
   const [isDetectingSilences, setIsDetectingSilences] = useState<boolean>(false);
   const [silenceError, setSilenceError] = useState<string | null>(null);
-  // Settings shared via a #preset= link. Read once on mount; the hash is
+  // Settings shared via a #preset= link. Read on mount and whenever the hash
+  // changes (pasting a second link while the app is open); the hash is
   // cleared when the user applies or dismisses the banner below.
   const [sharedPreset, setSharedPreset] = useState<VideoSettings | null>(() => readPresetShareFromLocation());
+
+  useEffect(() => {
+    const onHashChange = () => {
+      setSharedPreset(readPresetShareFromLocation());
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
 
   const handleApplySharedPreset = () => {
     if (sharedPreset) {
@@ -148,7 +183,7 @@ const App: React.FC = () => {
       const altShift = e.altKey && e.shiftKey && !modifier;
 
       // Alt+Shift+U: Upload video
-      if (altShift && e.key.toLowerCase() === 'u') {
+      if (altShift && e.code === 'KeyU') { // layout-independent: Alt+Shift itself switches layouts on Windows
         e.preventDefault();
         if (!videoFile && !isProcessing && !isSuggestingSettings) {
           document.querySelector('input[type="file"]')?.dispatchEvent(new MouseEvent('click'));
@@ -156,7 +191,7 @@ const App: React.FC = () => {
       }
       
       // Alt+Shift+P: Process video
-      if (altShift && e.key.toLowerCase() === 'p') {
+      if (altShift && e.code === 'KeyP') {
         e.preventDefault();
         if (videoFile && !isProcessing && !isSuggestingSettings) {
           handleProcessVideo();
@@ -164,7 +199,7 @@ const App: React.FC = () => {
       }
       
       // Alt+Shift+D: Download processed video
-      if (altShift && e.key.toLowerCase() === 'd') {
+      if (altShift && e.code === 'KeyD') {
         e.preventDefault();
         if (processedVideoUrl && !isProcessing) {
           const link = document.querySelector('a[download]') as HTMLAnchorElement;
@@ -282,15 +317,23 @@ const App: React.FC = () => {
 
   const handleFileSelect = (file: File) => {
     setVideoFile(file);
-    setProcessedVideoUrl(null); 
+    setProcessedVideoUrl(null);
     setGeminiError(null); // Clear AI error on new file
+    setGeminiPrompt(""); // The old prompt described the old clip
     setFileError(null); // Clear file error on successful selection
     setVideoDuration(undefined); // Reset duration
     setSilenceRegions(null); // Silence map belongs to the previous clip
     setSilenceError(null);
+    // Any in-flight AI edit or silence detection belongs to the previous
+    // clip: invalidate their responses and abort the detection outright.
+    aiRequestIdRef.current += 1;
+    silenceDetectGenRef.current += 1;
+    silenceDetectAbortRef.current?.abort();
+    silenceDetectAbortRef.current = null;
     // The trim window is measured against a specific video, so carrying one
-    // over from the previous clip would silently truncate this export.
-    commitSettings({ ...currentSettings, trimStartSeconds: null, trimEndSeconds: null });
+    // over from the previous clip would silently truncate this export. The
+    // undo stack is dropped too: its entries reference the old clip.
+    resetSettingsHistory({ ...currentSettings, trimStartSeconds: null, trimEndSeconds: null });
     
     // Probe the file for its duration. The object URL is revoked on every
     // path — including load failures — so the blob is not pinned in memory.
@@ -308,6 +351,24 @@ const App: React.FC = () => {
     };
     video.src = probeUrl;
   };
+
+  // Presets (shared links, file imports, AI edits) can carry trim values
+  // measured against a different clip — or against no clip at all. Whenever
+  // the duration is known, pull any out-of-range trim back inside it so the
+  // export can't silently truncate (or empty out) the video.
+  useEffect(() => {
+    if (typeof videoDuration !== 'number' || !isFinite(videoDuration) || videoDuration <= 0) return;
+    const { trimStartSeconds, trimEndSeconds } = currentSettings;
+    let nextStart = trimStartSeconds != null ? Math.max(0, Math.min(videoDuration, trimStartSeconds)) : null;
+    let nextEnd = trimEndSeconds != null ? Math.max(0, Math.min(videoDuration, trimEndSeconds)) : null;
+    if (nextStart != null && nextEnd != null && nextStart >= nextEnd) {
+      nextStart = null;
+      nextEnd = null;
+    }
+    if (nextStart !== trimStartSeconds || nextEnd !== trimEndSeconds) {
+      commitSettings({ ...currentSettings, trimStartSeconds: nextStart, trimEndSeconds: nextEnd });
+    }
+  }, [videoDuration, currentSettings, commitSettings]);
   
   const handleFileError = (error: string) => {
     setFileError(error);
@@ -323,6 +384,8 @@ const App: React.FC = () => {
   };
 
   const switchFeatureMode = (mode: FeatureMode) => {
+    // Any in-flight AI edit belongs to the previous mode's context.
+    aiRequestIdRef.current += 1;
     setFeatureMode(mode);
     setVideoFile(null);
     setProcessedVideoUrl(null);
@@ -348,17 +411,29 @@ const App: React.FC = () => {
   // dead-air stretches, and offer them up as export skip ranges.
   const handleDetectSilences = async () => {
     if (!videoFile || isDetectingSilences) return;
+    const generation = ++silenceDetectGenRef.current;
+    silenceDetectAbortRef.current?.abort();
+    const aborter = new AbortController();
+    silenceDetectAbortRef.current = aborter;
     setIsDetectingSilences(true);
     setSilenceError(null);
     try {
-      const { regions } = await detectSilences(videoFile);
+      const { regions } = await detectSilences(videoFile, { signal: aborter.signal });
+      // A newer detection (or a file change) superseded this one: drop it.
+      if (generation !== silenceDetectGenRef.current) return;
       setSilenceRegions(regions);
       setSkipSilences(true);
     } catch (e) {
+      if (generation !== silenceDetectGenRef.current) return;
+      // Aborts from a superseding detection/file change are silent.
+      if (e instanceof Error && e.name === 'AbortError') return;
       setSilenceError(e instanceof Error ? e.message : 'Silence detection failed.');
       setSilenceRegions(null);
     } finally {
-      setIsDetectingSilences(false);
+      if (generation === silenceDetectGenRef.current) {
+        silenceDetectAbortRef.current = null;
+        setIsDetectingSilences(false);
+      }
     }
   };
 
@@ -371,6 +446,11 @@ const App: React.FC = () => {
       setGeminiError("Please enter a description for the AI edit.");
       return;
     }
+
+    // Generation id: if the user starts another AI edit, picks a new file,
+    // or switches feature mode before this one returns, the late response
+    // is discarded instead of clobbering the new state.
+    const requestId = ++aiRequestIdRef.current;
 
     setIsSuggestingSettings(true);
     setGeminiError(null);
@@ -431,6 +511,7 @@ Return the full JSON settings object as instructed. If the request refines the c
           responseMimeType: "application/json",
         },
       });
+      if (requestId !== aiRequestIdRef.current) return; // superseded — drop the response
 
       const rawText = response.text;
       if (typeof rawText !== 'string' || !rawText.trim()) {
@@ -444,7 +525,14 @@ Return the full JSON settings object as instructed. If the request refines the c
         jsonStr = match[1].trim();
       }
 
-      const suggested = JSON.parse(jsonStr);
+      const parsed: unknown = JSON.parse(jsonStr);
+      // Gate the raw AI payload through sanitizeSettings: unknown keys are
+      // dropped, type mismatches fall back to defaults, and numbers are
+      // clamped to their valid ranges before anything reaches state.
+      const sanitized = sanitizeSettings(parsed);
+      if (!sanitized) {
+        throw new Error('The AI returned an unusable response. Please try rephrasing your description.');
+      }
 
       // Start from current settings so we keep things the AI doesn't address
       // (e.g. trim window, output format) and only override the fields it returns.
@@ -459,25 +547,19 @@ Return the full JSON settings object as instructed. If the request refines the c
       let invalidFieldCount = 0;
 
       aiAddressableKeys.forEach((key) => {
-        if (!Object.prototype.hasOwnProperty.call(suggested, key)) {
+        if (parsed === null || typeof parsed !== 'object' || !Object.prototype.hasOwnProperty.call(parsed, key)) {
           invalidFieldCount += 1;
           return;
         }
-        const suggestedValue = suggested[key];
+        const rawValue = (parsed as Record<string, unknown>)[key];
         const defaultValue = DEFAULT_VIDEO_SETTINGS[key];
-        if (typeof suggestedValue !== typeof defaultValue) {
+        if (typeof rawValue !== typeof defaultValue) {
           invalidFieldCount += 1;
           return;
         }
-        if (typeof suggestedValue === 'number') {
-          const range = (SETTINGS_RANGES as Record<string, { min: number; max: number }>)[key as string];
-          const clamped = range
-            ? Math.max(range.min, Math.min(range.max, suggestedValue))
-            : suggestedValue;
-          (newSettings[key] as number) = clamped;
-        } else {
-          (newSettings[key] as any) = suggestedValue;
-        }
+        // Take the sanitized value (already range-clamped); a wrong-typed raw
+        // value keeps the current setting instead of the sanitizer default.
+        (newSettings[key] as unknown) = sanitized[key];
       });
 
       // Trim is nullable and duration-aware, so it gets its own validation:
@@ -495,8 +577,8 @@ Return the full JSON settings object as instructed. If the request refines the c
         }
         (newSettings[key] as number | null) = Math.max(0, Math.min(videoDuration, value));
       };
-      applyTrim('trimStartSeconds', (suggested as Record<string, unknown>).trimStartSeconds);
-      applyTrim('trimEndSeconds', (suggested as Record<string, unknown>).trimEndSeconds);
+      applyTrim('trimStartSeconds', sanitized.trimStartSeconds);
+      applyTrim('trimEndSeconds', sanitized.trimEndSeconds);
       const aiTrimStart = newSettings.trimStartSeconds;
       const aiTrimEnd = newSettings.trimEndSeconds;
       if (aiTrimStart != null && aiTrimEnd != null && aiTrimStart >= aiTrimEnd) {
@@ -511,10 +593,15 @@ Return the full JSON settings object as instructed. If the request refines the c
       }
 
     } catch (e: any) {
+      if (requestId !== aiRequestIdRef.current) return; // superseded — stay silent
       console.error("Error getting or parsing AI suggestions:", e);
       setGeminiError(`Failed to get AI suggestions: ${e.message || 'Unknown error'}. Please try again or adjust settings manually.`);
     } finally {
-      setIsSuggestingSettings(false);
+      // Only clear the loading flag if this is still the latest request —
+      // otherwise we'd hide the spinner of the request that replaced it.
+      if (requestId === aiRequestIdRef.current) {
+        setIsSuggestingSettings(false);
+      }
     }
   };
 
