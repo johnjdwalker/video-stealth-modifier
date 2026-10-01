@@ -2,6 +2,8 @@ import { DEFAULT_VIDEO_SETTINGS, SETTINGS_RANGES } from '../constants';
 import { VideoSettings } from '../types';
 
 export const PRESET_SHARE_HASH_PREFIX = 'preset=';
+/** Version of the share-code envelope. Bump when the format changes. */
+export const PRESET_SHARE_CODE_VERSION = 1;
 
 function base64UrlEncode(input: string): string {
   const bytes = new TextEncoder().encode(input);
@@ -36,13 +38,23 @@ export function sanitizeSettings(input: unknown): VideoSettings | null {
     const defaultValue = DEFAULT_VIDEO_SETTINGS[key];
 
     if (typeof value !== typeof defaultValue) {
-      // The trim fields are `number | null`; allow null through.
-      if (value === null && (key === 'trimStartSeconds' || key === 'trimEndSeconds')) {
-        merged[key] = null;
+      // The trim fields are `number | null`: allow null through, and let
+      // finite numbers through too — a preset's trim window must survive
+      // sanitizing (the upper clamp happens at apply time, once the target
+      // clip's duration is known; the sanitizer can't know it).
+      if (key === 'trimStartSeconds' || key === 'trimEndSeconds') {
+        if (value === null) {
+          merged[key] = null;
+        } else if (typeof value === 'number' && Number.isFinite(value)) {
+          merged[key] = Math.max(0, value);
+        }
       }
       return;
     }
     if (typeof value === 'number' && typeof defaultValue === 'number') {
+      // Guard before clamping: Math.min/Math.max propagate NaN, so a
+      // non-finite value would poison the setting instead of clamping.
+      if (!Number.isFinite(value)) return;
       const range = (SETTINGS_RANGES as Record<string, { min: number; max: number } | undefined>)[key];
       merged[key] = range ? Math.max(range.min, Math.min(range.max, value)) : value;
     } else if (typeof value === 'boolean') {
@@ -58,15 +70,24 @@ export function sanitizeSettings(input: unknown): VideoSettings | null {
   return merged as unknown as VideoSettings;
 }
 
-/** Encode settings into a short URL-safe share code. */
+/** Encode settings into a short URL-safe share code (versioned envelope). */
 export function encodePresetShare(settings: VideoSettings): string {
-  return base64UrlEncode(JSON.stringify(settings));
+  return base64UrlEncode(JSON.stringify({ v: PRESET_SHARE_CODE_VERSION, settings }));
 }
 
 /** Decode a share code back into validated settings. Returns null when invalid. */
 export function decodePresetShare(code: string): VideoSettings | null {
   try {
-    return sanitizeSettings(JSON.parse(base64UrlDecode(code)));
+    const parsed: unknown = JSON.parse(base64UrlDecode(code));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const envelope = parsed as { v?: unknown; settings?: unknown };
+      // Current envelope: { v: 1, settings: {...} }. Codes shared before
+      // versioning were the bare settings object — accept those too.
+      if (envelope.v === PRESET_SHARE_CODE_VERSION && 'settings' in envelope) {
+        return sanitizeSettings(envelope.settings);
+      }
+    }
+    return sanitizeSettings(parsed);
   } catch {
     return null;
   }

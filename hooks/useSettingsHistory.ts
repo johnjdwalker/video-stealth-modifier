@@ -14,6 +14,11 @@ interface HistoryState {
   future: VideoSettings[];
 }
 
+/** Cheap deep-equal for settings objects (stable key order via spreads). */
+function settingsEqual(a: VideoSettings, b: VideoSettings): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 /**
  * Undo/redo history for the editor's VideoSettings.
  *
@@ -62,15 +67,19 @@ export function useSettingsHistory(getInitial: () => VideoSettings) {
     transientStartRef.current = null;
     if (start === null) return;
     const { settings: current, past: prevPast } = stateRef.current;
+    // The gesture may have ended where it started (dragged back): pushing
+    // that entry would create an undo step that changes nothing.
+    if (settingsEqual(start, current)) return;
     const nextPast = [...prevPast, start].slice(-MAX_HISTORY_ENTRIES);
     applyState({ settings: current, past: nextPast, future: [] });
   }, [applyState]);
 
-  /** Discrete change — records exactly one undo step. */
+  /** Discrete change — records exactly one undo step (skipped when nothing changed). */
   const commit = useCallback(
     (next: VideoSettings) => {
       flushTransient();
       const { settings: current, past: prevPast } = stateRef.current;
+      if (settingsEqual(next, current)) return;
       const nextPast = [...prevPast, current].slice(-MAX_HISTORY_ENTRIES);
       applyState({ settings: next, past: nextPast, future: [] });
     },
@@ -124,6 +133,24 @@ export function useSettingsHistory(getInitial: () => VideoSettings) {
     });
   }, [flushTransient, applyState]);
 
+  /**
+   * Drop the whole undo/redo stack and switch to `next` (defaults to the
+   * current settings). Used when the underlying video changes: history
+   * entries measured against the old clip's timeline are meaningless there.
+   * Any in-flight slider gesture is discarded, not flushed.
+   */
+  const resetHistory = useCallback(
+    (next?: VideoSettings) => {
+      if (transientTimerRef.current !== null) {
+        window.clearTimeout(transientTimerRef.current);
+        transientTimerRef.current = null;
+      }
+      transientStartRef.current = null;
+      applyState({ settings: next ?? stateRef.current.settings, past: [], future: [] });
+    },
+    [applyState]
+  );
+
   return {
     settings,
     commit,
@@ -132,5 +159,7 @@ export function useSettingsHistory(getInitial: () => VideoSettings) {
     redo,
     canUndo: past.length > 0,
     canRedo: future.length > 0,
+    flushTransient,
+    resetHistory,
   };
 }

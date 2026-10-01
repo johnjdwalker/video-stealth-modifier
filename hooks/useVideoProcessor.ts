@@ -22,6 +22,40 @@ export interface ProcessVideoOptions {
 }
 
 /**
+ * Everything one processVideo run holds: element, canvas, audio graph,
+ * recorder, stream, timers. Kept per-run (not in shared refs) so a new run
+ * started without cancelling the old one can't orphan run A's AudioContext,
+ * tracks, recorder, or visibility listener — cleanup() always disposes the
+ * currently-registered run, and every async callback closes over its own
+ * run's bundle.
+ */
+interface RunResources {
+  video: HTMLVideoElement;
+  canvas: HTMLCanvasElement;
+  audioContext: AudioContext | null;
+  mediaRecorder: MediaRecorder | null;
+  stream: MediaStream | null;
+  chunks: Blob[];
+  objectUrl: string | null;
+  rafId: number;
+  visibilityHandler: (() => void) | null;
+}
+
+function makeRunResources(video: HTMLVideoElement, canvas: HTMLCanvasElement): RunResources {
+  return {
+    video,
+    canvas,
+    audioContext: null,
+    mediaRecorder: null,
+    stream: null,
+    chunks: [],
+    objectUrl: null,
+    rafId: 0,
+    visibilityHandler: null,
+  };
+}
+
+/**
  * Picks the first MediaRecorder MIME type supported by this browser for the
  * requested output format. Falls back across the chain in OUTPUT_FORMAT_MIME_TYPES.
  */
@@ -87,15 +121,8 @@ export function useVideoProcessor() {
   const [progress, setProgress] = useState(0);
   const [isCancelling, setIsCancelling] = useState(false);
 
-  const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const animationFrameIdRef = useRef<number>(0);
-  const sourceObjectUrlRef = useRef<string | null>(null);
+  const activeRunRef = useRef<{ runId: number; resources: RunResources } | null>(null);
   const cancelledRef = useRef(false);
-  const visibilityHandlerRef = useRef<(() => void) | null>(null);
   /**
    * Generation counter for processVideo runs. Every async callback (onstop,
    * onplay, onended, drawFrame, seek continuations, visibility handler)
@@ -109,43 +136,54 @@ export function useVideoProcessor() {
   const rotationAngle1Ref = useRef<number>(0);
   const rotationAngle2Ref = useRef<number>(Math.PI / 2);
 
-  const cleanup = useCallback(async () => {
-    if (visibilityHandlerRef.current) {
-      document.removeEventListener('visibilitychange', visibilityHandlerRef.current);
-      visibilityHandlerRef.current = null;
+  /** Release every resource a run held. Null-safe: runs that failed during setup dispose cleanly. */
+  const disposeResources = async (resources: RunResources) => {
+    if (resources.visibilityHandler) {
+      document.removeEventListener('visibilitychange', resources.visibilityHandler);
+      resources.visibilityHandler = null;
     }
-    if (animationFrameIdRef.current) {
-      cancelAnimationFrame(animationFrameIdRef.current);
-      animationFrameIdRef.current = 0;
+    if (resources.rafId) {
+      cancelAnimationFrame(resources.rafId);
+      resources.rafId = 0;
     }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      try { mediaRecorderRef.current.stop(); } catch { /* ignore */ }
+    const mr = resources.mediaRecorder;
+    resources.mediaRecorder = null;
+    // stop() on a paused recorder is legal and fires onstop; the old code
+    // only stopped 'recording', so ending mid-silence-skip left the promise
+    // unsettled forever.
+    if (mr && (mr.state === 'recording' || mr.state === 'paused')) {
+      try { mr.stop(); } catch { /* ignore */ }
     }
-    mediaRecorderRef.current = null;
-    recordedChunksRef.current = [];
+    if (resources.stream) {
+      try { resources.stream.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+      resources.stream = null;
+    }
+    resources.chunks = [];
 
-    if (sourceVideoRef.current) {
-      sourceVideoRef.current.pause();
-      sourceVideoRef.current.removeAttribute('src');
-      sourceVideoRef.current.load();
-      sourceVideoRef.current = null;
-    }
+    try { resources.video.pause(); } catch { /* ignore */ }
+    resources.video.removeAttribute('src');
+    try { resources.video.load(); } catch { /* ignore */ }
     // Revoke the blob URL for the source file; without this every processing
-    // run pins another copy of the (up to 500MB) input in memory.
-    if (sourceObjectUrlRef.current) {
-      URL.revokeObjectURL(sourceObjectUrlRef.current);
-      sourceObjectUrlRef.current = null;
+    // run pins another copy of the input in memory.
+    if (resources.objectUrl) {
+      URL.revokeObjectURL(resources.objectUrl);
+      resources.objectUrl = null;
     }
-    if (canvasRef.current) {
-      canvasRef.current = null;
-    }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+    if (resources.audioContext && resources.audioContext.state !== 'closed') {
       try {
-        await audioContextRef.current.close();
+        await resources.audioContext.close();
       } catch (e) {
         console.error('Error closing AudioContext:', e);
       }
-      audioContextRef.current = null;
+      resources.audioContext = null;
+    }
+  };
+
+  const cleanup = useCallback(async () => {
+    const run = activeRunRef.current;
+    activeRunRef.current = null;
+    if (run) {
+      await disposeResources(run.resources);
     }
   }, []);
 
@@ -209,6 +247,23 @@ export function useVideoProcessor() {
     rotationAngle2Ref.current = Math.PI / 2;
 
     return new Promise<string | null>((resolve, reject) => {
+      // Every resolve/reject in this executor goes through these: the old
+      // code had paths (stale recorder errors, throws out of event handlers)
+      // where the caller's `await processVideo(...)` never resumed.
+      let settled = false;
+      const resolveOnce = (value: string | null) => {
+        if (!settled) {
+          settled = true;
+          resolve(value);
+        }
+      };
+      const rejectOnce = (reason?: unknown) => {
+        if (!settled) {
+          settled = true;
+          reject(reason);
+        }
+      };
+
       // Exporting while the tab is hidden guarantees a desynced file: rAF
       // stops firing but MediaRecorder keeps muxing a frozen video track
       // against a running audio track. Refuse up front with a clear message.
@@ -216,25 +271,28 @@ export function useVideoProcessor() {
         const err = 'Please keep this tab visible while exporting — background tabs freeze video encoding and corrupt the output.';
         setProcessingError(err);
         setIsProcessing(false);
-        reject(new Error(err));
+        rejectOnce(new Error(err));
         return;
       }
 
       const video = document.createElement('video');
-      sourceVideoRef.current = video;
-
       const canvas = document.createElement('canvas');
-      canvasRef.current = canvas;
 
       const ctx = canvas.getContext('2d', { alpha: false });
       if (!ctx) {
         const err = 'Could not get canvas context.';
         setProcessingError(err);
         setIsProcessing(false);
-        cleanup().catch(console.error);
-        reject(new Error(err));
+        rejectOnce(new Error(err));
         return;
       }
+
+      // Register the run's resources BEFORE any await point: every early
+      // failure below funnels through cleanup(), which disposes whatever this
+      // run managed to create so far.
+      const resources = makeRunResources(video, canvas);
+      resources.objectUrl = URL.createObjectURL(videoFile);
+      activeRunRef.current = { runId, resources };
 
       // Safari < 18 has no CanvasRenderingContext2D.filter: color adjustments
       // would silently do nothing in the export while the CSS-based preview
@@ -246,16 +304,16 @@ export function useVideoProcessor() {
       }
 
       try {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        resources.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       } catch (e) {
         const err = 'AudioContext not supported.';
         setProcessingError(err);
         setIsProcessing(false);
         cleanup().catch(console.error);
-        reject(new Error(err));
+        rejectOnce(new Error(err));
         return;
       }
-      const audioContext = audioContextRef.current;
+      const audioContext = resources.audioContext;
 
       video.onloadedmetadata = async () => {
         if (isStale()) return;
@@ -264,7 +322,7 @@ export function useVideoProcessor() {
           setProcessingError(err);
           setIsProcessing(false);
           cleanup().catch(console.error);
-          reject(new Error(err));
+          rejectOnce(new Error(err));
           return;
         }
 
@@ -318,7 +376,9 @@ export function useVideoProcessor() {
         // Seek to trim start before starting playback so we don't record leading frames.
         // The seek is raced against a timeout: if 'seeked' never fires (e.g. the
         // run was cancelled mid-seek), we must not leave the promise unsettled.
-        if (trimStart > 0) {
+        // Short-circuit: seeking to (almost) the current position never fires
+        // 'seeked' on some browsers and would eat the whole 10s timeout.
+        if (trimStart > 0 && Math.abs(video.currentTime - trimStart) > 0.04) {
           const seeked = await new Promise<boolean>((resolveSeek) => {
             const timer = window.setTimeout(() => {
               video.removeEventListener('seeked', onSeeked);
@@ -353,8 +413,7 @@ export function useVideoProcessor() {
           const sourceNode = audioContext.createMediaElementSource(video);
           const node = audioContext.createGain();
           const targetGain = settings.volume / 100;
-          const fadeIn = Math.max(0, settings.audioFadeInSeconds || 0);
-          node.gain.value = fadeIn > 0 ? 0 : targetGain;
+          node.gain.value = targetGain;
           sourceNode.connect(node);
 
           const audioDestinationNode = audioContext.createMediaStreamDestination();
@@ -365,12 +424,35 @@ export function useVideoProcessor() {
           console.warn('Could not process audio track; exporting video only:', audioErr);
         }
 
+        // Fades are driven by the video's own clock (media time), evaluated
+        // per frame. The old code scheduled them on AudioContext time, but a
+        // silence-skip pause stops the video while ctx time keeps running —
+        // so a pause before the fade-out made it fire early and clip audio.
+        const fadeTargetGain = settings.volume / 100;
+        const fadeInSeconds = Math.max(0, settings.audioFadeInSeconds || 0);
+        const fadeOutSeconds = Math.max(0, settings.audioFadeOutSeconds || 0);
+        const updateFadeGain = () => {
+          if (!gainNode || !resources.audioContext) return;
+          const t = resources.video.currentTime;
+          let g = fadeTargetGain;
+          if (fadeInSeconds > 0) {
+            g *= Math.min(1, Math.max(0, (t - trimStart) / fadeInSeconds));
+          }
+          if (fadeOutSeconds > 0) {
+            g *= Math.min(1, Math.max(0, (trimEnd - t) / fadeOutSeconds));
+          }
+          try {
+            gainNode.gain.setTargetAtTime(g, resources.audioContext.currentTime, 0.03);
+          } catch { /* ignore */ }
+        };
+
         const canvasStream = canvas.captureStream(FPS);
         const videoTrack = canvasStream.getVideoTracks()[0];
 
         const tracks: MediaStreamTrack[] = [videoTrack];
         if (audioTrack) tracks.push(audioTrack);
         const combinedStream = new MediaStream(tracks);
+        resources.stream = combinedStream;
 
         const mimeType = pickSupportedMimeType(settings.outputFormat);
         if (!mimeType) {
@@ -379,7 +461,7 @@ export function useVideoProcessor() {
           setProcessingError(err);
           setIsProcessing(false);
           cleanup().catch(console.error);
-          reject(new Error(err));
+          rejectOnce(new Error(err));
           return;
         }
 
@@ -391,95 +473,132 @@ export function useVideoProcessor() {
         }
 
         try {
-          mediaRecorderRef.current = new MediaRecorder(combinedStream, recorderOptions);
+          resources.mediaRecorder = new MediaRecorder(combinedStream, recorderOptions);
         } catch (e: any) {
           const err = `Failed to create MediaRecorder: ${e.message}.`;
           console.error(err, e);
           setProcessingError(err);
           setIsProcessing(false);
           cleanup().catch(console.error);
-          reject(new Error(err));
+          rejectOnce(new Error(err));
           return;
         }
-        const mediaRecorder = mediaRecorderRef.current;
-        recordedChunksRef.current = [];
+        const mediaRecorder = resources.mediaRecorder;
+        resources.chunks = [];
+
+        const stopRecording = () => {
+          const mr = resources.mediaRecorder;
+          // stop() on a paused recorder is legal and fires onstop; only
+          // stopping 'recording' left pause-held runs unsettled (item: stale
+          // promise when the video ends mid-silence-skip).
+          if (mr && (mr.state === 'recording' || mr.state === 'paused')) {
+            try { mr.stop(); } catch { /* ignore */ }
+          }
+          if (resources.rafId) {
+            cancelAnimationFrame(resources.rafId);
+            resources.rafId = 0;
+          }
+        };
+
+        /**
+         * Abort the run with a user-visible error: stop capture, release the
+         * run's resources, settle the promise. Used for failures that surface
+         * mid-run — e.g. video.play() rejecting with NotAllowedError on
+         * Safari/iOS once the user gesture has expired — where silently
+         * ending would hand the user a broken file with no explanation.
+         */
+        const failRun = (message: string, err?: unknown) => {
+          console.error(message, err);
+          setProcessingError(message);
+          setIsProcessing(false);
+          stopRecording();
+          cleanup().catch(console.error);
+          rejectOnce(err instanceof Error ? err : new Error(message));
+        };
 
         // --- Background-tab handling -------------------------------------
         // rAF freezes in hidden tabs while MediaRecorder keeps muxing. Pause
-        // both the video and the recorder (and suspend the AudioContext so
-        // scheduled fades don't drift), then resume when visible again.
+        // both the video and the recorder (and suspend the AudioContext),
+        // then resume when visible again. Fades are driven by the video clock
+        // (updateFadeGain), so suspending no longer skews them.
         let suspendedForHidden = false;
-        let fadesScheduled = false;
         const onVisibilityChange = () => {
           if (isStale()) return;
-          const mr = mediaRecorderRef.current;
-          const videoEl = sourceVideoRef.current;
+          const mr = resources.mediaRecorder;
+          const videoEl = resources.video;
           if (document.hidden) {
             if (mr && mr.state === 'recording') { try { mr.pause(); } catch { /* ignore */ } }
-            if (videoEl && !videoEl.paused) { videoEl.pause(); }
-            if (audioContext.state === 'running') { audioContext.suspend().catch(() => {}); }
+            if (!videoEl.paused) { videoEl.pause(); }
+            if (resources.audioContext && resources.audioContext.state === 'running') {
+              resources.audioContext.suspend().catch(() => {});
+            }
             suspendedForHidden = true;
           } else if (suspendedForHidden) {
             suspendedForHidden = false;
-            if (audioContext.state === 'suspended') { audioContext.resume().catch(console.error); }
+            if (resources.audioContext && resources.audioContext.state === 'suspended') {
+              resources.audioContext.resume().catch(console.error);
+            }
             if (mr && mr.state === 'paused') { try { mr.resume(); } catch { /* ignore */ } }
-            if (videoEl && videoEl.paused && !videoEl.ended) { videoEl.play().catch(() => {}); }
+            if (videoEl.paused && !videoEl.ended) {
+              videoEl.play().catch((err) => {
+                if (isStale()) return;
+                // A failed resume would otherwise spin the draw loop forever
+                // (paused + suspendedForHidden re-arms rAF indefinitely).
+                failRun(
+                  'Could not resume video playback after the tab became visible again. The export was stopped to avoid a corrupted file.',
+                  err
+                );
+              });
+            }
           }
         };
-        visibilityHandlerRef.current = onVisibilityChange;
+        resources.visibilityHandler = onVisibilityChange;
         document.addEventListener('visibilitychange', onVisibilityChange);
-
-        const stopRecording = () => {
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-            try { mediaRecorderRef.current.stop(); } catch { /* ignore */ }
-          }
-          if (animationFrameIdRef.current) {
-            cancelAnimationFrame(animationFrameIdRef.current);
-            animationFrameIdRef.current = 0;
-          }
-        };
 
         mediaRecorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
-            recordedChunksRef.current.push(event.data);
+            resources.chunks.push(event.data);
           }
         };
 
         mediaRecorder.onstop = () => {
           if (isStale() || cancelledRef.current) {
-            // Cancelled mid-recording or superseded by a newer run: throw the
-            // partial capture away and leave the (cancellation / new run)
-            // state untouched.
-            recordedChunksRef.current = [];
-            mediaRecorderRef.current = null;
-            if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
-            animationFrameIdRef.current = 0;
-            resolve(null);
+            // Cancelled mid-recording or superseded by a newer run: the run
+            // that superseded/cancelled owns disposal — just settle.
+            resolveOnce(null);
+            return;
+          }
+          if (settled) {
+            // The run already failed (failRun settled the promise and showed
+            // the error); a partial onstop must not overwrite that state.
             return;
           }
 
-          const blob = new Blob(recordedChunksRef.current, { type: mediaRecorder.mimeType });
-          recordedChunksRef.current = [];
+          const blob = new Blob(resources.chunks, { type: mediaRecorder.mimeType });
+          resources.chunks = [];
           const url = URL.createObjectURL(blob);
           setProcessedVideoUrl(url);
           setProcessedMimeType(mediaRecorder.mimeType || mimeType);
           setIsProcessing(false);
           setProgress(100);
 
-          // Release everything the run held: stop the captured tracks, close
-          // the AudioContext (browsers cap live contexts at ~6), and revoke
-          // the source blob URL. The output URL is intentionally kept.
-          try { combinedStream.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
-          mediaRecorderRef.current = null;
-          if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
-          animationFrameIdRef.current = 0;
+          // Release everything the run held (tracks, AudioContext, source
+          // blob URL). The output URL is intentionally kept.
           cleanup().catch(console.error);
 
-          resolve(url);
+          resolveOnce(url);
         };
 
         mediaRecorder.onerror = (event: Event) => {
-          if (isStale()) return;
+          if (isStale()) {
+            // The old code returned here without settling: the caller's await
+            // never resumed. Settle as an abort — resolveOnce makes this a
+            // no-op if the promise already settled.
+            const abortError = new Error('Export superseded by a newer run.');
+            abortError.name = 'AbortError';
+            rejectOnce(abortError);
+            return;
+          }
           const recorderEventError = (event as any).error;
           let errorMessageText = 'MediaRecorder unspecified error';
           let errorToReject: Error;
@@ -499,7 +618,7 @@ export function useVideoProcessor() {
           setProcessingError(errorMessageText);
           setIsProcessing(false);
           cleanup().catch(console.error);
-          reject(errorToReject);
+          rejectOnce(errorToReject);
         };
 
         const baseFilter = buildCanvasFilter(settings);
@@ -520,8 +639,8 @@ export function useVideoProcessor() {
         const noiseTile = settings.enablePixelNoise ? createNoiseTile() : null;
 
         const drawSingleFrame = () => {
-          const canvasEl = canvasRef.current;
-          const videoEl = sourceVideoRef.current;
+          const canvasEl = resources.canvas;
+          const videoEl = resources.video;
           if (!canvasEl || !videoEl) return;
 
           ctx.save();
@@ -591,6 +710,9 @@ export function useVideoProcessor() {
         // mistake "paused" for the end of the export.
         let isSkippingSilence = false;
         let lastSkipEnd = -1; // end of the most recently skipped range
+        // Moving index into the sorted skipRanges: advanced past anything
+        // already skipped or behind us, so we don't scan the array per frame.
+        let skipIdx = 0;
 
         /**
          * Cut one silent stretch: hold the recorder, jump the video past the
@@ -601,9 +723,16 @@ export function useVideoProcessor() {
         const skipSilenceRange = (videoEl: HTMLVideoElement, range: SilenceRegion): Promise<void> => {
           return new Promise((resolve) => {
             if (isStale()) { resolve(); return; }
+            const target = Math.min(range.end, trimEnd);
+            // Short-circuit: seeking to (almost) the current position never
+            // fires 'seeked' on some browsers and would eat the 10s timeout.
+            if (Math.abs(videoEl.currentTime - target) < 0.05) {
+              resolve();
+              return;
+            }
             isSkippingSilence = true;
             lastSkipEnd = range.end;
-            const mr = mediaRecorderRef.current;
+            const mr = resources.mediaRecorder;
             if (mr && mr.state === 'recording') { try { mr.pause(); } catch { /* ignore */ } }
             videoEl.pause();
 
@@ -620,7 +749,7 @@ export function useVideoProcessor() {
                 .then(() => {
                   isSkippingSilence = false;
                   if (isStale()) return;
-                  const mr2 = mediaRecorderRef.current;
+                  const mr2 = resources.mediaRecorder;
                   // Never resume the recorder while hidden: rAF is frozen, so
                   // the canvas would mux frozen frames against live audio
                   // (the desync the visibility handler exists to prevent).
@@ -628,9 +757,17 @@ export function useVideoProcessor() {
                   const hidden = typeof document !== 'undefined' && document.hidden;
                   if (mr2 && mr2.state === 'paused' && !hidden) { try { mr2.resume(); } catch { /* ignore */ } }
                 })
-                .catch(() => {
+                .catch((playErr) => {
                   isSkippingSilence = false;
-                  // play failed; drawFrame observes the paused element and ends the run
+                  // A failed resume after a silence skip must not die
+                  // silently: abort the run with an explicit error so the
+                  // user gets a message, not a truncated export.
+                  if (!isStale()) {
+                    failRun(
+                      'Could not resume video playback after skipping silence. The export was stopped to avoid a corrupted file.',
+                      playErr
+                    );
+                  }
                 })
                 .finally(() => resolve());
             };
@@ -645,7 +782,7 @@ export function useVideoProcessor() {
             };
             videoEl.addEventListener('seeked', onSeeked);
             try {
-              videoEl.currentTime = Math.min(range.end, trimEnd);
+              videoEl.currentTime = target;
             } catch {
               window.clearTimeout(timer);
               videoEl.removeEventListener('seeked', onSeeked);
@@ -656,8 +793,8 @@ export function useVideoProcessor() {
 
         const drawFrame = (now: number) => {
           if (isStale()) return;
-          const videoEl = sourceVideoRef.current;
-          const canvasEl = canvasRef.current;
+          const videoEl = resources.video;
+          const canvasEl = resources.canvas;
           if (!videoEl || !canvasEl) {
             stopRecording();
             return;
@@ -668,7 +805,7 @@ export function useVideoProcessor() {
             if (suspendedForHidden && !videoEl.ended) {
               // Auto-paused for a hidden tab: keep the loop armed (rAF is
               // frozen while hidden anyway); drawing resumes on visibility.
-              animationFrameIdRef.current = requestAnimationFrame(drawFrame);
+              resources.rafId = requestAnimationFrame(drawFrame);
               return;
             }
             stopRecording();
@@ -688,15 +825,28 @@ export function useVideoProcessor() {
           // isSkippingSilence on every path so this branch can't wedge.
           // lastSkipEnd keeps a keyframe-snapped seek from re-triggering.
           if (!isSkippingSilence && skipRanges.length > 0) {
-            const silentRange = skipRanges.find(
-              (r) => r.end > lastSkipEnd + 0.02 && videoEl.currentTime >= r.start && videoEl.currentTime < r.end
-            );
-            if (silentRange) {
-              void skipSilenceRange(videoEl, silentRange);
-              animationFrameIdRef.current = requestAnimationFrame(drawFrame);
+            while (
+              skipIdx < skipRanges.length &&
+              (skipRanges[skipIdx].end <= lastSkipEnd + 0.02 ||
+                videoEl.currentTime >= skipRanges[skipIdx].end)
+            ) {
+              skipIdx++;
+            }
+            const candidate = skipIdx < skipRanges.length ? skipRanges[skipIdx] : undefined;
+            if (
+              candidate &&
+              videoEl.currentTime >= candidate.start &&
+              videoEl.currentTime < candidate.end
+            ) {
+              void skipSilenceRange(videoEl, candidate);
+              resources.rafId = requestAnimationFrame(drawFrame);
               return;
             }
           }
+
+          // Fades follow the video clock (see updateFadeGain): a silence-skip
+          // pause must not shift them.
+          updateFadeGain();
 
           // Time-based animation: the old code advanced rotation once per rAF
           // tick, so effects ran 4-5x faster on 120/144Hz displays while the
@@ -728,7 +878,7 @@ export function useVideoProcessor() {
               setProgress(progressValue);
             }
           }
-          animationFrameIdRef.current = requestAnimationFrame(drawFrame);
+          resources.rafId = requestAnimationFrame(drawFrame);
         };
 
         video.onplay = () => {
@@ -736,43 +886,22 @@ export function useVideoProcessor() {
           // Guard against double-scheduling: re-arms (e.g. after the
           // background-tab auto-resume) must cancel the previous loop first,
           // or two loops draw concurrently and the orphan can never be stopped.
-          if (animationFrameIdRef.current) {
-            cancelAnimationFrame(animationFrameIdRef.current);
-            animationFrameIdRef.current = 0;
+          if (resources.rafId) {
+            cancelAnimationFrame(resources.rafId);
+            resources.rafId = 0;
           }
           if (audioContext.state === 'suspended' && !suspendedForHidden) {
             audioContext.resume().catch(console.error);
           }
 
-          // Schedule audio fades once per run using audioContext.currentTime.
-          // (Re-scheduling on every play event — e.g. the auto-resume after a
-          // hidden tab — would restart the fade mid-video.)
-          const localGainNode = gainNode;
-          if (localGainNode && !fadesScheduled) {
-            fadesScheduled = true;
-            const targetGain = settings.volume / 100;
-            const fadeIn = Math.max(0, settings.audioFadeInSeconds || 0);
-            const fadeOut = Math.max(0, settings.audioFadeOutSeconds || 0);
-            const speed = Math.max(0.0001, settings.playbackSpeed);
-            const realDuration = segmentDuration > 0 ? segmentDuration / speed : 0;
-
-            const t0 = audioContext.currentTime;
-            localGainNode.gain.cancelScheduledValues(t0);
-            if (fadeIn > 0) {
-              localGainNode.gain.setValueAtTime(0, t0);
-              localGainNode.gain.linearRampToValueAtTime(targetGain, t0 + Math.min(fadeIn, realDuration || fadeIn));
-            } else {
-              localGainNode.gain.setValueAtTime(targetGain, t0);
-            }
-            if (fadeOut > 0 && realDuration > 0) {
-              const fadeStart = Math.max(t0, t0 + realDuration - fadeOut);
-              localGainNode.gain.setValueAtTime(targetGain, fadeStart);
-              localGainNode.gain.linearRampToValueAtTime(0, t0 + realDuration);
-            }
-          }
+          // Note: audio fades are NOT scheduled here. They used to be
+          // scheduled once on audioContext.currentTime, but silence-skip
+          // pauses stop the video while ctx time keeps running, which made
+          // the fade-out fire early and clip audio. updateFadeGain() drives
+          // them from the video clock every frame instead (see drawFrame).
 
           lastFrameNow = 0;
-          animationFrameIdRef.current = requestAnimationFrame(drawFrame);
+          resources.rafId = requestAnimationFrame(drawFrame);
         };
 
         video.onended = () => {
@@ -784,17 +913,27 @@ export function useVideoProcessor() {
         // on the video instead of black frames (the canvas has never been
         // painted at this point; the video is already seeked and pausable).
         drawSingleFrame();
+        // Prime the fade gain before the first recorded frame.
+        updateFadeGain();
 
-        mediaRecorder.start();
+        try {
+          mediaRecorder.start();
+        } catch (e) {
+          // start() throws synchronously (e.g. InvalidStateError) — without
+          // this the exception escapes the event handler and the promise
+          // never settles.
+          failRun(`Could not start recording: ${e instanceof Error ? e.message : 'unknown error'}`, e);
+          return;
+        }
         video.play().catch(err => {
           if (isStale()) return;
-          const errorMsg = `Could not start video playback: ${err.message}`;
-          console.error(errorMsg, err);
-          setProcessingError(errorMsg);
-          setIsProcessing(false);
-          stopRecording();
-          cleanup().catch(console.error);
-          reject(err);
+          // play() after the awaits above can throw NotAllowedError on
+          // Safari/iOS once the user gesture has expired — an explicit error
+          // beats a silently empty export.
+          const gestureHint = err && err.name === 'NotAllowedError'
+            ? ' The browser blocked playback (on iPhone/iPad, start the export with a tap and keep this tab visible).'
+            : '';
+          failRun(`Could not start video playback: ${err?.message || err}.${gestureHint}`, err);
         });
       };
 
@@ -805,12 +944,10 @@ export function useVideoProcessor() {
         setProcessingError(err);
         setIsProcessing(false);
         cleanup().catch(console.error);
-        reject(new Error(err));
+        rejectOnce(new Error(err));
       };
 
-      const objectUrl = URL.createObjectURL(videoFile);
-      sourceObjectUrlRef.current = objectUrl;
-      video.src = objectUrl;
+      video.src = resources.objectUrl;
     });
   }, [cleanup]);
 
