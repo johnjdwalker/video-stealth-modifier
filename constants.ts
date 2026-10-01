@@ -159,6 +159,21 @@ export const OUTPUT_FORMAT_EXTENSIONS: Record<VideoSettings['outputFormat'], str
   'mp4-h264': 'mp4',
 };
 
+// Export quality presets: one click picks a sensible target bitrate.
+// 0 = auto (browser default). Values chosen for 1080p-ish output.
+export const OUTPUT_QUALITY_PRESETS: Array<{
+  id: string;
+  label: string;
+  bitrateKbps: number;
+  description: string;
+}> = [
+  { id: 'auto', label: 'Auto', bitrateKbps: 0, description: 'Browser default bitrate' },
+  { id: 'draft', label: 'Draft', bitrateKbps: 2500, description: 'Small file, quick share (~2.5 Mbps)' },
+  { id: 'standard', label: 'Standard', bitrateKbps: 8000, description: 'Balanced quality (~8 Mbps)' },
+  { id: 'high', label: 'High', bitrateKbps: 15000, description: 'Crisp 1080p (~15 Mbps)' },
+  { id: 'max', label: 'Max', bitrateKbps: 30000, description: 'Near-lossless archive (~30 Mbps)' },
+];
+
 // Watermark detection constants
 export const WATERMARK_DETECTION_SAMPLE_COUNT = 5; // Minimum frames to sample
 export const WATERMARK_DETECTION_SAMPLE_INTERVAL_SECONDS = 2; // Sample every 2 seconds
