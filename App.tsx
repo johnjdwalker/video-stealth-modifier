@@ -1,21 +1,23 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { VideoSettings } from './types';
 import {
   DEFAULT_VIDEO_SETTINGS,
   APP_TITLE,
   SETTINGS_STORAGE_KEY,
-  SETTINGS_RANGES,
   OUTPUT_FORMAT_EXTENSIONS,
 } from './constants';
 import VideoUploader from './components/VideoUploader';
-import VideoPlayer from './components/VideoPlayer';
+import ComparePlayers from './components/ComparePlayers';
 import ModificationControls from './components/ModificationControls';
 import VideoInfo from './components/VideoInfo';
 import WatermarkRemover from './components/WatermarkRemover';
 import SoraWatermarkRemover from './components/SoraWatermarkRemover';
 import { useVideoProcessor } from './hooks/useVideoProcessor';
+import { useSettingsHistory } from './hooks/useSettingsHistory';
+import { clearPresetShareFromLocation, readPresetShareFromLocation, sanitizeSettings } from './utils/presetSharing';
+import { detectSilences, SilenceRegion } from './utils/silenceDetection';
 import DownloadIcon from './components/icons/DownloadIcon';
 import ProcessingSpinnerIcon from './components/icons/ProcessingSpinnerIcon';
 
@@ -40,7 +42,7 @@ const App: React.FC = () => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   
-  const [currentSettings, setCurrentSettings] = useState<VideoSettings>(() => {
+  const loadInitialSettings = (): VideoSettings => {
     try {
       const savedSettings = localStorage.getItem(SETTINGS_STORAGE_KEY);
       if (savedSettings) {
@@ -52,7 +54,44 @@ const App: React.FC = () => {
       console.error("Failed to load settings from localStorage:", error);
       return DEFAULT_VIDEO_SETTINGS;
     }
-  });
+  };
+
+  const {
+    settings: currentSettings,
+    commit: commitSettings,
+    updateTransient: updateTransientSettings,
+    undo: undoSettings,
+    redo: redoSettings,
+    canUndo: canUndoSettings,
+    canRedo: canRedoSettings,
+    flushTransient: flushTransientSettings,
+    resetHistory: resetSettingsHistory,
+  } = useSettingsHistory(loadInitialSettings);
+
+  // Monotonic ids so late async responses can be recognized as stale: the AI
+  // suggestion id is bumped on every new request, file change, and feature
+  // mode switch; the silence-detection id on every new detection and file
+  // change. A response whose id no longer matches is discarded.
+  const aiRequestIdRef = useRef(0);
+  const silenceDetectGenRef = useRef(0);
+  const silenceDetectAbortRef = useRef<AbortController | null>(null);
+
+  // Flush a pending slider-gesture undo entry the moment the gesture ends
+  // (pointer released anywhere, window blurred, key released) instead of
+  // waiting for the inactivity timer — so Ctrl+Z right after a drag works.
+  const flushTransientRef = useRef(flushTransientSettings);
+  flushTransientRef.current = flushTransientSettings;
+  useEffect(() => {
+    const flush = () => flushTransientRef.current();
+    window.addEventListener('pointerup', flush);
+    window.addEventListener('blur', flush);
+    window.addEventListener('keyup', flush);
+    return () => {
+      window.removeEventListener('pointerup', flush);
+      window.removeEventListener('blur', flush);
+      window.removeEventListener('keyup', flush);
+    };
+  }, []);
 
   const [debouncedSettingsForPreview, setDebouncedSettingsForPreview] = useState<VideoSettings>(currentSettings);
   
@@ -64,6 +103,7 @@ const App: React.FC = () => {
     processedVideoUrl,
     processedMimeType,
     processingError,
+    processingWarning,
     progress,
     setProcessedVideoUrl,
   } = useVideoProcessor();
@@ -74,17 +114,54 @@ const App: React.FC = () => {
   const [fileError, setFileError] = useState<string | null>(null);
   const [browserCompatibilityError, setBrowserCompatibilityError] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState<number | undefined>(undefined);
+  // Silence detection results for the current video. Derived from the file
+  // (not the settings), so they're cleared whenever the video changes.
+  const [silenceRegions, setSilenceRegions] = useState<SilenceRegion[] | null>(null);
+  const [skipSilences, setSkipSilences] = useState<boolean>(true);
+  const [isDetectingSilences, setIsDetectingSilences] = useState<boolean>(false);
+  const [silenceError, setSilenceError] = useState<string | null>(null);
+  // Settings shared via a #preset= link. Read on mount and whenever the hash
+  // changes (pasting a second link while the app is open); the hash is
+  // cleared when the user applies or dismisses the banner below.
+  const [sharedPreset, setSharedPreset] = useState<VideoSettings | null>(() => readPresetShareFromLocation());
+
+  useEffect(() => {
+    const onHashChange = () => {
+      setSharedPreset(readPresetShareFromLocation());
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  const handleApplySharedPreset = () => {
+    if (sharedPreset) {
+      commitSettings({ ...sharedPreset });
+    }
+    clearPresetShareFromLocation();
+    setSharedPreset(null);
+  };
+
+  const handleDismissSharedPreset = () => {
+    clearPresetShareFromLocation();
+    setSharedPreset(null);
+  };
 
   const handleProcessVideo = useCallback(async () => {
     if (videoFile) {
       try {
-        await processVideo(videoFile, currentSettings);
+        await processVideo(
+          videoFile,
+          currentSettings,
+          skipSilences && silenceRegions && silenceRegions.length > 0
+            ? { skipRanges: silenceRegions }
+            : undefined
+        );
       } catch (error) {
         console.error("Processing failed in App:", error);
         // Error is handled by useVideoProcessor's processingError state
       }
     }
-  }, [videoFile, currentSettings, processVideo]);
+  }, [videoFile, currentSettings, processVideo, skipSilences, silenceRegions]);
 
   // Effect to add keyboard shortcuts
   useEffect(() => {
@@ -101,29 +178,48 @@ const App: React.FC = () => {
 
       // Use Cmd on Mac, Ctrl on Windows/Linux
       const modifier = e.metaKey || e.ctrlKey;
-      
-      // Ctrl/Cmd + U: Upload video
-      if (modifier && e.key === 'u') {
+      // Browser-safe combo (Alt+Shift) for actions browsers already claim:
+      // Ctrl+P (print), Ctrl+D (bookmark), Ctrl+U (view source) all conflict.
+      const altShift = e.altKey && e.shiftKey && !modifier;
+
+      // Alt+Shift+U: Upload video
+      if (altShift && e.code === 'KeyU') { // layout-independent: Alt+Shift itself switches layouts on Windows
         e.preventDefault();
         if (!videoFile && !isProcessing && !isSuggestingSettings) {
           document.querySelector('input[type="file"]')?.dispatchEvent(new MouseEvent('click'));
         }
       }
       
-      // Ctrl/Cmd + P: Process video
-      if (modifier && e.key === 'p') {
+      // Alt+Shift+P: Process video
+      if (altShift && e.code === 'KeyP') {
         e.preventDefault();
         if (videoFile && !isProcessing && !isSuggestingSettings) {
           handleProcessVideo();
         }
       }
       
-      // Ctrl/Cmd + D: Download processed video
-      if (modifier && e.key === 'd') {
+      // Alt+Shift+D: Download processed video
+      if (altShift && e.code === 'KeyD') {
         e.preventDefault();
         if (processedVideoUrl && !isProcessing) {
           const link = document.querySelector('a[download]') as HTMLAnchorElement;
           link?.click();
+        }
+      }
+
+      // Ctrl/Cmd + Z: Undo settings change
+      if (modifier && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        if (canUndoSettings && !isProcessing && !isSuggestingSettings) {
+          undoSettings();
+        }
+      }
+
+      // Ctrl/Cmd + Shift + Z or Ctrl/Cmd + Y: Redo settings change
+      if (modifier && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        if (canRedoSettings && !isProcessing && !isSuggestingSettings) {
+          redoSettings();
         }
       }
       
@@ -137,7 +233,7 @@ const App: React.FC = () => {
     
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
-  }, [videoFile, isProcessing, isSuggestingSettings, processedVideoUrl, isCancelling, handleProcessVideo, cancelProcessing]);
+  }, [videoFile, isProcessing, isSuggestingSettings, processedVideoUrl, isCancelling, handleProcessVideo, cancelProcessing, canUndoSettings, canRedoSettings, undoSettings, redoSettings]);
   
   // Effect to check browser compatibility on mount
   useEffect(() => {
@@ -221,13 +317,23 @@ const App: React.FC = () => {
 
   const handleFileSelect = (file: File) => {
     setVideoFile(file);
-    setProcessedVideoUrl(null); 
+    setProcessedVideoUrl(null);
     setGeminiError(null); // Clear AI error on new file
+    setGeminiPrompt(""); // The old prompt described the old clip
     setFileError(null); // Clear file error on successful selection
     setVideoDuration(undefined); // Reset duration
+    setSilenceRegions(null); // Silence map belongs to the previous clip
+    setSilenceError(null);
+    // Any in-flight AI edit or silence detection belongs to the previous
+    // clip: invalidate their responses and abort the detection outright.
+    aiRequestIdRef.current += 1;
+    silenceDetectGenRef.current += 1;
+    silenceDetectAbortRef.current?.abort();
+    silenceDetectAbortRef.current = null;
     // The trim window is measured against a specific video, so carrying one
-    // over from the previous clip would silently truncate this export.
-    setCurrentSettings((prev) => ({ ...prev, trimStartSeconds: null, trimEndSeconds: null }));
+    // over from the previous clip would silently truncate this export. The
+    // undo stack is dropped too: its entries reference the old clip.
+    resetSettingsHistory({ ...currentSettings, trimStartSeconds: null, trimEndSeconds: null });
     
     // Probe the file for its duration. The object URL is revoked on every
     // path — including load failures — so the blob is not pinned in memory.
@@ -245,6 +351,24 @@ const App: React.FC = () => {
     };
     video.src = probeUrl;
   };
+
+  // Presets (shared links, file imports, AI edits) can carry trim values
+  // measured against a different clip — or against no clip at all. Whenever
+  // the duration is known, pull any out-of-range trim back inside it so the
+  // export can't silently truncate (or empty out) the video.
+  useEffect(() => {
+    if (typeof videoDuration !== 'number' || !isFinite(videoDuration) || videoDuration <= 0) return;
+    const { trimStartSeconds, trimEndSeconds } = currentSettings;
+    let nextStart = trimStartSeconds != null ? Math.max(0, Math.min(videoDuration, trimStartSeconds)) : null;
+    let nextEnd = trimEndSeconds != null ? Math.max(0, Math.min(videoDuration, trimEndSeconds)) : null;
+    if (nextStart != null && nextEnd != null && nextStart >= nextEnd) {
+      nextStart = null;
+      nextEnd = null;
+    }
+    if (nextStart !== trimStartSeconds || nextEnd !== trimEndSeconds) {
+      commitSettings({ ...currentSettings, trimStartSeconds: nextStart, trimEndSeconds: nextEnd });
+    }
+  }, [videoDuration, currentSettings, commitSettings]);
   
   const handleFileError = (error: string) => {
     setFileError(error);
@@ -252,16 +376,24 @@ const App: React.FC = () => {
   };
 
   const handleSettingsChange = (newSettings: VideoSettings) => {
-    setCurrentSettings(newSettings); 
+    commitSettings(newSettings);
+  };
+
+  const handleSettingsChangeTransient = (newSettings: VideoSettings) => {
+    updateTransientSettings(newSettings);
   };
 
   const switchFeatureMode = (mode: FeatureMode) => {
+    // Any in-flight AI edit belongs to the previous mode's context.
+    aiRequestIdRef.current += 1;
     setFeatureMode(mode);
     setVideoFile(null);
     setProcessedVideoUrl(null);
     setGeminiError(null);
     setFileError(null);
     setVideoDuration(undefined);
+    setSilenceRegions(null);
+    setSilenceError(null);
   };
 
   const handleUploadDifferent = () => {
@@ -271,24 +403,61 @@ const App: React.FC = () => {
     setGeminiError(null);
     setFileError(null);
     setVideoDuration(undefined);
+    setSilenceRegions(null);
+    setSilenceError(null);
   };
 
-  const handleSuggestSettings = async () => {
+  // One-click silence removal: analyze the audio track on-device, map the
+  // dead-air stretches, and offer them up as export skip ranges.
+  const handleDetectSilences = async () => {
+    if (!videoFile || isDetectingSilences) return;
+    const generation = ++silenceDetectGenRef.current;
+    silenceDetectAbortRef.current?.abort();
+    const aborter = new AbortController();
+    silenceDetectAbortRef.current = aborter;
+    setIsDetectingSilences(true);
+    setSilenceError(null);
+    try {
+      const { regions } = await detectSilences(videoFile, { signal: aborter.signal });
+      // A newer detection (or a file change) superseded this one: drop it.
+      if (generation !== silenceDetectGenRef.current) return;
+      setSilenceRegions(regions);
+      setSkipSilences(true);
+    } catch (e) {
+      if (generation !== silenceDetectGenRef.current) return;
+      // Aborts from a superseding detection/file change are silent.
+      if (e instanceof Error && e.name === 'AbortError') return;
+      setSilenceError(e instanceof Error ? e.message : 'Silence detection failed.');
+      setSilenceRegions(null);
+    } finally {
+      if (generation === silenceDetectGenRef.current) {
+        silenceDetectAbortRef.current = null;
+        setIsDetectingSilences(false);
+      }
+    }
+  };
+
+  const runAiEdit = async (promptText: string) => {
     if (!ai) {
       setGeminiError("AI features are not available. API key might be missing or invalid.");
       return;
     }
-    if (!geminiPrompt.trim()) {
-      setGeminiError("Please enter a description for AI suggestions.");
+    if (!promptText.trim()) {
+      setGeminiError("Please enter a description for the AI edit.");
       return;
     }
+
+    // Generation id: if the user starts another AI edit, picks a new file,
+    // or switches feature mode before this one returns, the late response
+    // is discarded instead of clobbering the new state.
+    const requestId = ++aiRequestIdRef.current;
 
     setIsSuggestingSettings(true);
     setGeminiError(null);
 
-    const systemInstruction = `You are an expert video editing assistant. Your goal is to suggest subtle modifications for a video based on the user's request.
-Return your suggestions *only* as a JSON object. Do not include any explanatory text before or after the JSON object.
-The JSON object must strictly adhere to the following structure and data types. All fields are required:
+    const systemInstruction = `You are an expert video colorist and editor. Translate the user's plain-English description of a look or mood into exact video adjustment settings.
+Return your answer *only* as a JSON object. Do not include any explanatory text before or after the JSON object.
+The JSON object must contain ALL of the following fields with the specified types:
 {
   "brightness": number,            /* Range: 0-200, 100 = unchanged. */
   "contrast": number,              /* Range: 0-200, 100 = unchanged. */
@@ -305,13 +474,33 @@ The JSON object must strictly adhere to the following structure and data types. 
   "flipHorizontal": boolean,
   "enableRotatingLines": boolean,
   "enablePixelNoise": boolean,
-  "audioPreservesPitch": boolean
+  "audioPreservesPitch": boolean,
+  "trimStartSeconds": number | null,   /* Seconds. null = start of video. Set ONLY when the user explicitly asks to cut/trim/remove/keep a time range. */
+  "trimEndSeconds": number | null      /* Seconds. null = end of video. Set ONLY when the user explicitly asks to cut/trim/keep a time range. */
 }
-Focus on subtle changes suitable for making a video distinct without being overly dramatic. Avoid combining many heavy effects at once.`;
+Rules:
+- Be decisive. If the user wants drama, push values hard (contrast 130-160, saturation 120-150, vignette 40-70). Timid near-default values are a failure.
+- Match the request literally: "black and white" means grayscale 100; "slow motion feel" means playbackSpeed 0.7-0.85; "fast and punchy" means playbackSpeed 1.2-1.5.
+- Combine at most 3-4 strong adjustments; leave everything else at neutral.
+- Neutral values: brightness 100, contrast 100, saturation 100, hueRotate 0, blur 0, sepia 0, grayscale 0, vignette 0, playbackSpeed 1.0, volume 100, audioFadeInSeconds 0, audioFadeOutSeconds 0, flipHorizontal false, enableRotatingLines false, enablePixelNoise false, audioPreservesPitch true, trimStartSeconds null, trimEndSeconds null.
+- Trim ONLY when the request explicitly mentions cutting, trimming, removing, skipping, or keeping a time range. "cut the first 8 seconds" -> trimStartSeconds 8, trimEndSeconds null. "keep 0:10 to 0:45" -> trimStartSeconds 10, trimEndSeconds 45. "remove the last 5 seconds" -> trimStartSeconds null, trimEndSeconds (duration - 5). Parse m:ss as minutes*60+seconds. Never invent a trim the user didn't ask for; when no trim is requested, return both as null.
+- When the request refines existing settings (words like "more", "less", "a bit", "stronger"), adjust relative to the provided current settings instead of starting from neutral.
 
-    const userRequestPrompt = `User request: "${geminiPrompt.trim()}"
+Examples:
+User: "moody noir film" -> {"brightness":92,"contrast":145,"saturation":100,"hueRotate":0,"blur":0,"sepia":0,"grayscale":100,"vignette":55,"playbackSpeed":0.9,"volume":100,"audioFadeInSeconds":1,"audioFadeOutSeconds":1.5,"flipHorizontal":false,"enableRotatingLines":false,"enablePixelNoise":true,"audioPreservesPitch":true,"trimStartSeconds":null,"trimEndSeconds":null}
+User: "warm golden-hour glow" -> {"brightness":108,"contrast":105,"saturation":125,"hueRotate":-8,"blur":0,"sepia":18,"grayscale":0,"vignette":20,"playbackSpeed":1.0,"volume":100,"audioFadeInSeconds":0,"audioFadeOutSeconds":0,"flipHorizontal":false,"enableRotatingLines":false,"enablePixelNoise":false,"audioPreservesPitch":true,"trimStartSeconds":null,"trimEndSeconds":null}
+User: "dreamy slow wedding video" -> {"brightness":110,"contrast":95,"saturation":115,"hueRotate":0,"blur":1.5,"sepia":10,"grayscale":0,"vignette":15,"playbackSpeed":0.8,"volume":95,"audioFadeInSeconds":1.5,"audioFadeOutSeconds":2,"flipHorizontal":false,"enableRotatingLines":false,"enablePixelNoise":false,"audioPreservesPitch":true,"trimStartSeconds":null,"trimEndSeconds":null}
+User: "cut the first 8 seconds" -> {"brightness":100,"contrast":100,"saturation":100,"hueRotate":0,"blur":0,"sepia":0,"grayscale":0,"vignette":0,"playbackSpeed":1.0,"volume":100,"audioFadeInSeconds":0,"audioFadeOutSeconds":0,"flipHorizontal":false,"enableRotatingLines":false,"enablePixelNoise":false,"audioPreservesPitch":true,"trimStartSeconds":8,"trimEndSeconds":null}`;
 
-Based on the user's request, provide the JSON settings object as instructed.`;
+    const durationNote = typeof videoDuration === 'number' && isFinite(videoDuration) && videoDuration > 0
+      ? `Video duration: ${videoDuration.toFixed(1)} seconds.`
+      : 'Video duration is unknown: return trimStartSeconds and trimEndSeconds as null.';
+    const userRequestPrompt = `Current settings (JSON): ${JSON.stringify(currentSettings)}
+${durationNote}
+
+User request: "${promptText.trim()}"
+
+Return the full JSON settings object as instructed. If the request refines the current settings, adjust relative to them; otherwise build the look fresh.`;
 
     try {
       const response: GenerateContentResponse = await ai.models.generateContent({
@@ -322,6 +511,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
           responseMimeType: "application/json",
         },
       });
+      if (requestId !== aiRequestIdRef.current) return; // superseded — drop the response
 
       const rawText = response.text;
       if (typeof rawText !== 'string' || !rawText.trim()) {
@@ -335,7 +525,14 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         jsonStr = match[1].trim();
       }
 
-      const suggested = JSON.parse(jsonStr);
+      const parsed: unknown = JSON.parse(jsonStr);
+      // Gate the raw AI payload through sanitizeSettings: unknown keys are
+      // dropped, type mismatches fall back to defaults, and numbers are
+      // clamped to their valid ranges before anything reaches state.
+      const sanitized = sanitizeSettings(parsed);
+      if (!sanitized) {
+        throw new Error('The AI returned an unusable response. Please try rephrasing your description.');
+      }
 
       // Start from current settings so we keep things the AI doesn't address
       // (e.g. trim window, output format) and only override the fields it returns.
@@ -350,38 +547,72 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       let invalidFieldCount = 0;
 
       aiAddressableKeys.forEach((key) => {
-        if (!Object.prototype.hasOwnProperty.call(suggested, key)) {
+        if (parsed === null || typeof parsed !== 'object' || !Object.prototype.hasOwnProperty.call(parsed, key)) {
           invalidFieldCount += 1;
           return;
         }
-        const suggestedValue = suggested[key];
+        const rawValue = (parsed as Record<string, unknown>)[key];
         const defaultValue = DEFAULT_VIDEO_SETTINGS[key];
-        if (typeof suggestedValue !== typeof defaultValue) {
+        if (typeof rawValue !== typeof defaultValue) {
           invalidFieldCount += 1;
           return;
         }
-        if (typeof suggestedValue === 'number') {
-          const range = (SETTINGS_RANGES as Record<string, { min: number; max: number }>)[key as string];
-          const clamped = range
-            ? Math.max(range.min, Math.min(range.max, suggestedValue))
-            : suggestedValue;
-          (newSettings[key] as number) = clamped;
-        } else {
-          (newSettings[key] as any) = suggestedValue;
-        }
+        // Take the sanitized value (already range-clamped); a wrong-typed raw
+        // value keeps the current setting instead of the sanitizer default.
+        (newSettings[key] as unknown) = sanitized[key];
       });
 
-      setCurrentSettings(newSettings);
+      // Trim is nullable and duration-aware, so it gets its own validation:
+      // accept only finite numbers inside [0, duration], and require a valid
+      // window when both ends are set. Anything else leaves the current trim.
+      const applyTrim = (key: 'trimStartSeconds' | 'trimEndSeconds', value: unknown) => {
+        if (value === null || value === undefined) return;
+        if (typeof value !== 'number' || !isFinite(value)) {
+          invalidFieldCount += 1;
+          return;
+        }
+        if (typeof videoDuration !== 'number' || !isFinite(videoDuration) || videoDuration <= 0) {
+          invalidFieldCount += 1;
+          return;
+        }
+        (newSettings[key] as number | null) = Math.max(0, Math.min(videoDuration, value));
+      };
+      applyTrim('trimStartSeconds', sanitized.trimStartSeconds);
+      applyTrim('trimEndSeconds', sanitized.trimEndSeconds);
+      const aiTrimStart = newSettings.trimStartSeconds;
+      const aiTrimEnd = newSettings.trimEndSeconds;
+      if (aiTrimStart != null && aiTrimEnd != null && aiTrimStart >= aiTrimEnd) {
+        newSettings.trimStartSeconds = currentSettings.trimStartSeconds;
+        newSettings.trimEndSeconds = currentSettings.trimEndSeconds;
+        invalidFieldCount += 1;
+      }
+
+      commitSettings(newSettings);
       if (invalidFieldCount > 0) {
         setGeminiError(`AI suggestion was partially applied (${invalidFieldCount} field${invalidFieldCount === 1 ? '' : 's'} missing or invalid).`);
       }
 
     } catch (e: any) {
+      if (requestId !== aiRequestIdRef.current) return; // superseded — stay silent
       console.error("Error getting or parsing AI suggestions:", e);
       setGeminiError(`Failed to get AI suggestions: ${e.message || 'Unknown error'}. Please try again or adjust settings manually.`);
     } finally {
-      setIsSuggestingSettings(false);
+      // Only clear the loading flag if this is still the latest request —
+      // otherwise we'd hide the spinner of the request that replaced it.
+      if (requestId === aiRequestIdRef.current) {
+        setIsSuggestingSettings(false);
+      }
     }
+  };
+
+  const handleSuggestSettings = () => {
+    void runAiEdit(geminiPrompt);
+  };
+
+  const handleSurpriseMe = () => {
+    void runAiEdit(
+      "Invent a bold, striking, unconventional video look — something a viewer would immediately notice. Surprise me."
+    );
   };
   
   const controlsDisabled = !videoFile || isProcessing || isSuggestingSettings;
@@ -393,6 +624,14 @@ Based on the user's request, provide the JSON settings object as instructed.`;
         <p className="text-gray-400 mt-2">
           Subtly modify your videos. Adjust visual properties, speed, and audio. Compare original with modified preview. Get AI suggestions!
         </p>
+        <div className="flex flex-wrap justify-center gap-2 mt-4">
+          <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-900/60 text-emerald-300 border border-emerald-700/50">
+            🔒 100% on-device — your video never leaves this browser
+          </span>
+          <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-indigo-900/60 text-indigo-300 border border-indigo-700/50">
+            No watermark · Free 1080p exports · No account needed
+          </span>
+        </div>
         
         {/* Feature Tabs */}
         <div className="flex flex-wrap justify-center gap-3 mt-6">
@@ -450,6 +689,28 @@ Based on the user's request, provide the JSON settings object as instructed.`;
       )}
 
       <main className="w-full max-w-5xl">
+        {sharedPreset && (
+          <div className="mb-8 bg-indigo-900 border-2 border-indigo-500 p-5 rounded-lg" role="status">
+            <h3 className="text-lg font-bold text-indigo-200 mb-1">Shared settings detected 🔗</h3>
+            <p className="text-indigo-100 text-sm mb-4">
+              This link contains video settings shared with you. Applying them will replace your current adjustments (you can undo with Ctrl+Z).
+            </p>
+            <div className="flex flex-wrap gap-3">
+              <button
+                onClick={handleApplySharedPreset}
+                className="px-5 py-2 bg-indigo-500 hover:bg-indigo-400 text-white font-semibold rounded-lg transition-colors"
+              >
+                Apply shared settings
+              </button>
+              <button
+                onClick={handleDismissSharedPreset}
+                className="px-5 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 font-semibold rounded-lg transition-colors"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
         {featureMode === 'sora' ? (
           <SoraWatermarkRemover />
         ) : featureMode === 'watermark' ? (
@@ -479,16 +740,11 @@ Based on the user's request, provide the JSON settings object as instructed.`;
                     </div>
                   ) : (
                     <>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div>
-                          <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Original</h4>
-                          <VideoPlayer src={previewUrl} settings={DEFAULT_VIDEO_SETTINGS} isOriginal={true} />
-                        </div>
-                        <div>
-                          <h4 className="text-lg font-semibold mb-2 text-center text-gray-300">Modified Preview</h4>
-                          <VideoPlayer src={previewUrl} settings={debouncedSettingsForPreview} />
-                        </div>
-                      </div>
+                      <ComparePlayers
+                        src={previewUrl}
+                        settings={debouncedSettingsForPreview}
+                        disabled={isProcessing || isSuggestingSettings}
+                      />
                       <VideoInfo 
                         fileName={videoFile.name}
                         fileSize={videoFile.size}
@@ -512,14 +768,26 @@ Based on the user's request, provide the JSON settings object as instructed.`;
               <ModificationControls
                 settings={currentSettings}
                 onSettingsChange={handleSettingsChange}
+                onSettingsChangeTransient={handleSettingsChangeTransient}
+                onUndo={undoSettings}
+                onRedo={redoSettings}
+                canUndo={canUndoSettings}
+                canRedo={canRedoSettings}
                 disabled={controlsDisabled}
                 geminiPrompt={geminiPrompt}
                 onGeminiPromptChange={setGeminiPrompt}
                 onSuggestSettings={handleSuggestSettings}
+                onSurpriseMe={handleSurpriseMe}
                 isSuggestingSettings={isSuggestingSettings}
                 geminiError={geminiError}
                 aiAvailable={!!ai}
                 videoDuration={videoDuration}
+                silenceRegions={silenceRegions}
+                skipSilences={skipSilences}
+                onToggleSkipSilences={setSkipSilences}
+                onDetectSilences={handleDetectSilences}
+                isDetectingSilences={isDetectingSilences}
+                silenceError={silenceError}
               />
               
               {videoFile && (
@@ -553,6 +821,13 @@ Based on the user's request, provide the JSON settings object as instructed.`;
                       </button>
                     </>
                   )}
+                </div>
+              )}
+
+              {processingWarning && !isProcessing && (
+                <div className="bg-yellow-800 p-4 rounded-lg text-yellow-100">
+                  <p className="font-semibold">Video Processing Warning:</p>
+                  <p className="text-sm">{processingWarning}</p>
                 </div>
               )}
 
@@ -602,15 +877,19 @@ Based on the user's request, provide the JSON settings object as instructed.`;
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <div className="flex justify-between items-center gap-4">
                 <span className="text-gray-400">Upload Video:</span>
-                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Ctrl+U</kbd>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Alt+Shift+U</kbd>
               </div>
               <div className="flex justify-between items-center gap-4">
                 <span className="text-gray-400">Process Video:</span>
-                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Ctrl+P</kbd>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Alt+Shift+P</kbd>
               </div>
               <div className="flex justify-between items-center gap-4">
                 <span className="text-gray-400">Download:</span>
-                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Ctrl+D</kbd>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Alt+Shift+D</kbd>
+              </div>
+              <div className="flex justify-between items-center gap-4">
+                <span className="text-gray-400">Undo / Redo:</span>
+                <kbd className="px-2 py-1 bg-gray-700 rounded text-xs font-mono">Ctrl+Z / Ctrl+Y</kbd>
               </div>
               <div className="flex justify-between items-center gap-4">
                 <span className="text-gray-400">Cancel:</span>
@@ -618,7 +897,7 @@ Based on the user's request, provide the JSON settings object as instructed.`;
               </div>
             </div>
             <p className="text-xs text-gray-500 mt-3">
-              * Use <kbd className="px-1 py-0.5 bg-gray-700 rounded text-xs">Cmd</kbd> instead of <kbd className="px-1 py-0.5 bg-gray-700 rounded text-xs">Ctrl</kbd> on Mac
+              * Use <kbd className="px-1 py-0.5 bg-gray-700 rounded text-xs">⌥⇧</kbd> instead of <kbd className="px-1 py-0.5 bg-gray-700 rounded text-xs">Alt+Shift</kbd> on Mac. Ctrl+P/D/U are left to the browser (print / bookmark / view source).
             </p>
           </div>
         </details>

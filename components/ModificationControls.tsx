@@ -1,29 +1,52 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { CustomPreset, VideoSettings } from '../types';
+import { SilenceRegion, formatSilenceTime } from '../utils/silenceDetection';
 import {
   CUSTOM_PRESETS_STORAGE_KEY,
   DEFAULT_VIDEO_SETTINGS,
   OUTPUT_FORMAT_LABELS,
   OUTPUT_FORMAT_MIME_TYPES,
+  OUTPUT_QUALITY_PRESETS,
   PRESET_DESCRIPTIONS,
   SETTINGS_PRESETS,
 } from '../constants';
+import {
+  buildPresetShareUrl,
+  parsePresetFile,
+  serializePresetFile,
+} from '../utils/presetSharing';
 import SliderControl from './SliderControl';
 import ResetIcon from './icons/ResetIcon';
 import ProcessingSpinnerIcon from './icons/ProcessingSpinnerIcon';
 
 interface ModificationControlsProps {
   settings: VideoSettings;
+  /** Discrete change: preset applied, toggle flipped, reset — one undo step. */
   onSettingsChange: (newSettings: VideoSettings) => void;
+  /** Continuous change (slider drag) — live update, one undo step per gesture. */
+  onSettingsChangeTransient: (newSettings: VideoSettings) => void;
+  onUndo: () => void;
+  onRedo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
   disabled?: boolean;
   geminiPrompt: string;
   onGeminiPromptChange: (prompt: string) => void;
   onSuggestSettings: () => void;
+  onSurpriseMe: () => void;
   isSuggestingSettings: boolean;
   geminiError: string | null;
   aiAvailable: boolean;
   /** Source video duration in seconds, used for trim controls. */
   videoDuration?: number;
+  /** Detected silence regions for the current video (null = not analyzed yet). */
+  silenceRegions: SilenceRegion[] | null;
+  /** Whether detected silences are cut from the export. */
+  skipSilences: boolean;
+  onToggleSkipSilences: (skip: boolean) => void;
+  onDetectSilences: () => void;
+  isDetectingSilences: boolean;
+  silenceError: string | null;
 }
 
 function loadCustomPresets(): CustomPreset[] {
@@ -121,19 +144,33 @@ const ToggleRow: React.FC<{
 const ModificationControls: React.FC<ModificationControlsProps> = ({
   settings,
   onSettingsChange,
+  onSettingsChangeTransient,
+  onUndo,
+  onRedo,
+  canUndo,
+  canRedo,
   disabled,
   geminiPrompt,
   onGeminiPromptChange,
   onSuggestSettings,
+  onSurpriseMe,
   isSuggestingSettings,
   geminiError,
   aiAvailable,
   videoDuration,
+  silenceRegions,
+  skipSilences,
+  onToggleSkipSilences,
+  onDetectSilences,
+  isDetectingSilences,
+  silenceError,
 }) => {
   const [showPresets, setShowPresets] = useState(false);
   const [customPresets, setCustomPresets] = useState<CustomPreset[]>(() => loadCustomPresets());
   const [newPresetName, setNewPresetName] = useState('');
   const [presetMessage, setPresetMessage] = useState<string | null>(null);
+  const [shareMessage, setShareMessage] = useState<string | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     saveCustomPresets(customPresets);
@@ -151,7 +188,7 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
   }, []);
 
   const updateNumber = <K extends keyof VideoSettings>(key: K, value: number) => {
-    onSettingsChange({ ...settings, [key]: value as VideoSettings[K] });
+    onSettingsChangeTransient({ ...settings, [key]: value as VideoSettings[K] });
   };
 
   const updateBool = <K extends keyof VideoSettings>(key: K, value: boolean) => {
@@ -201,6 +238,80 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
     setPresetMessage(`Preset "${name}" deleted.`);
   };
 
+  /** Synchronous execCommand fallback for the share-link copy. */
+  const legacyCopyToClipboard = (text: string): boolean => {
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return ok;
+    } catch {
+      return false;
+    }
+  };
+
+  const handleCopyShareLink = () => {
+    const url = buildPresetShareUrl(settings);
+    const done = (ok: boolean) =>
+      setShareMessage(
+        ok
+          ? 'Share link copied! Anyone opening it can apply these exact settings.'
+          : 'Could not copy automatically — your browser blocked clipboard access.'
+      );
+    // writeText must be called synchronously inside the click handler: any
+    // await before it surrenders the user gesture and Safari/Firefox reject
+    // the write. The promise is observed without awaiting.
+    try {
+      const pending = navigator.clipboard.writeText(url);
+      Promise.resolve(pending).then(
+        () => done(true),
+        () => done(legacyCopyToClipboard(url))
+      );
+    } catch {
+      done(legacyCopyToClipboard(url));
+    }
+  };
+
+  const handleDownloadPreset = () => {
+    const blob = new Blob([serializePresetFile(settings)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'video-stealth-modifier-preset.json';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    // Revoke on a delay, not immediately: revoking before the browser has
+    // grabbed the download breaks it in some browsers.
+    window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setShareMessage('Preset file downloaded.');
+  };
+
+  const handleImportPresetFile = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const parsed = parsePresetFile(typeof reader.result === 'string' ? reader.result : '');
+      if (parsed) {
+        onSettingsChange({ ...DEFAULT_VIDEO_SETTINGS, ...parsed });
+        setShareMessage(`Preset imported from "${file.name}".`);
+      } else {
+        setShareMessage(`Could not import "${file.name}" — it is not a valid preset file.`);
+      }
+    };
+    reader.onerror = () => {
+      setShareMessage(`Could not read "${file.name}".`);
+    };
+    reader.readAsText(file);
+  };
+
   const commonDisabledState = disabled || isSuggestingSettings;
 
   const trimStart = settings.trimStartSeconds ?? 0;
@@ -211,43 +322,135 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
     <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
       {aiAvailable && (
         <div className="mb-6 pb-6 border-b border-gray-700">
-          <h4 className="text-lg font-semibold text-gray-100 mb-3">AI Suggestions ✨</h4>
+          <h4 className="text-lg font-semibold text-gray-100 mb-3">AI Edit Mode ✨</h4>
           <label htmlFor="geminiPrompt" className="block text-sm font-medium text-gray-300 mb-1">
-            Describe desired changes (e.g., "vintage look", "more energetic"):
+            Describe the look you want (e.g., "moody noir film", "warm golden-hour glow"):
           </label>
           <textarea
             id="geminiPrompt"
             value={geminiPrompt}
             onChange={(e) => onGeminiPromptChange(e.target.value)}
-            placeholder="e.g., make it feel like an old film, slightly brighter"
+            placeholder='e.g., "moody noir film", "more contrast", or "cut the first 8 seconds"'
             rows={3}
             className="w-full p-2 bg-gray-700 border border-gray-600 rounded-md text-gray-100 focus:ring-indigo-500 focus:border-indigo-500 disabled:opacity-50"
             disabled={commonDisabledState}
-            aria-label="Describe desired changes for AI suggestion"
+            aria-label="Describe the look you want for the AI edit"
           />
-          <button
-            onClick={onSuggestSettings}
-            disabled={commonDisabledState || !geminiPrompt.trim()}
-            className="mt-3 w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
-            aria-live="polite"
-          >
-            {isSuggestingSettings ? (
-              <>
-                <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
-                Suggesting...
-              </>
-            ) : (
-              'Suggest Settings with AI'
-            )}
-          </button>
+          <div className="mt-3 flex gap-2">
+            <button
+              onClick={onSuggestSettings}
+              disabled={commonDisabledState || !geminiPrompt.trim()}
+              className="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg shadow-md flex items-center justify-center transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              aria-live="polite"
+            >
+              {isSuggestingSettings ? (
+                <>
+                  <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
+                  Editing...
+                </>
+              ) : (
+                'Apply AI Edit'
+              )}
+            </button>
+            <button
+              onClick={onSurpriseMe}
+              disabled={commonDisabledState}
+              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-100 font-semibold rounded-lg shadow-md transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Let the AI invent a bold, unexpected look"
+            >
+              🎲 Surprise me
+            </button>
+          </div>
           {geminiError && <p className="text-red-400 text-xs mt-2" role="alert">{geminiError}</p>}
         </div>
       )}
+
+      <div className="mb-6 pb-6 border-b border-gray-700">
+        <h4 className="text-lg font-semibold text-gray-100 mb-3">🎙️ Silence Removal</h4>
+        <p className="text-sm text-gray-400 mb-3">
+          Detect dead air in the audio and cut it from the export — on-device, no upload.
+        </p>
+        {!silenceRegions ? (
+          <button
+            onClick={onDetectSilences}
+            disabled={commonDisabledState || isDetectingSilences}
+            className="px-4 py-2 bg-teal-600 hover:bg-teal-700 text-white font-semibold rounded-lg shadow-md flex items-center transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isDetectingSilences ? (
+              <>
+                <ProcessingSpinnerIcon className="w-5 h-5 mr-2" />
+                Analyzing audio...
+              </>
+            ) : (
+              'Detect silences'
+            )}
+          </button>
+        ) : (
+          <div>
+            <p className="text-sm text-gray-300 mb-2">
+              Found <span className="font-semibold text-teal-300">{silenceRegions.length}</span>{' '}
+              silent {silenceRegions.length === 1 ? 'stretch' : 'stretches'} (
+              {silenceRegions.reduce((sum, r) => sum + (r.end - r.start), 0).toFixed(1)}s total).
+            </p>
+            {silenceRegions.length > 0 && (
+              <>
+                <label className="flex items-center gap-2 text-sm text-gray-200 mb-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={skipSilences}
+                    onChange={(e) => onToggleSkipSilences(e.target.checked)}
+                    disabled={commonDisabledState}
+                    className="w-4 h-4 accent-teal-500"
+                  />
+                  Cut silences from the export
+                </label>
+                <ul className="text-xs text-gray-400 space-y-0.5 mb-2 max-h-24 overflow-y-auto">
+                  {silenceRegions.slice(0, 12).map((r, i) => (
+                    <li key={i}>
+                      {formatSilenceTime(r.start)} → {formatSilenceTime(r.end)}
+                      <span className="text-gray-500"> ({(r.end - r.start).toFixed(1)}s)</span>
+                    </li>
+                  ))}
+                  {silenceRegions.length > 12 && (
+                    <li className="text-gray-500">…and {silenceRegions.length - 12} more</li>
+                  )}
+                </ul>
+              </>
+            )}
+            <button
+              onClick={onDetectSilences}
+              disabled={commonDisabledState || isDetectingSilences}
+              className="text-xs text-gray-400 hover:text-gray-200 underline disabled:opacity-50"
+            >
+              Re-analyze
+            </button>
+          </div>
+        )}
+        {silenceError && <p className="text-red-400 text-xs mt-2" role="alert">{silenceError}</p>}
+      </div>
 
       <div className="mb-2">
         <div className="flex justify-between items-center mb-3">
           <h3 className="text-xl font-semibold text-gray-100">Manual Adjustments</h3>
           <div className="flex gap-2">
+            <button
+              onClick={onUndo}
+              disabled={commonDisabledState || !canUndo}
+              className="px-3 py-1.5 text-sm rounded-md bg-gray-700 hover:bg-gray-600 text-gray-200 font-medium transition-colors disabled:opacity-50"
+              title="Undo settings change (Ctrl+Z)"
+              aria-label="Undo settings change"
+            >
+              ↩ Undo
+            </button>
+            <button
+              onClick={onRedo}
+              disabled={commonDisabledState || !canRedo}
+              className="px-3 py-1.5 text-sm rounded-md bg-gray-700 hover:bg-gray-600 text-gray-200 font-medium transition-colors disabled:opacity-50"
+              title="Redo settings change (Ctrl+Shift+Z)"
+              aria-label="Redo settings change"
+            >
+              ↪ Redo
+            </button>
             <button
               onClick={() => setShowPresets(!showPresets)}
               disabled={commonDisabledState}
@@ -344,6 +547,47 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
                 <p className="text-xs text-gray-400 mt-2" role="status">{presetMessage}</p>
               )}
             </div>
+
+            <div className="pt-3 border-t border-gray-800">
+              <p className="text-xs text-gray-400 mb-2">Share this look:</p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={handleCopyShareLink}
+                  disabled={commonDisabledState}
+                  className="px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-md transition-colors disabled:opacity-50"
+                  title="Copy a link that applies these exact settings when opened"
+                >
+                  Copy share link
+                </button>
+                <button
+                  onClick={handleDownloadPreset}
+                  disabled={commonDisabledState}
+                  className="px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-gray-200 font-medium rounded-md transition-colors disabled:opacity-50"
+                  title="Download these settings as a JSON preset file"
+                >
+                  Download JSON
+                </button>
+                <button
+                  onClick={() => importFileInputRef.current?.click()}
+                  disabled={commonDisabledState}
+                  className="px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-gray-200 font-medium rounded-md transition-colors disabled:opacity-50"
+                  title="Import settings from a JSON preset file"
+                >
+                  Import JSON
+                </button>
+                <input
+                  ref={importFileInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  className="hidden"
+                  onChange={handleImportPresetFile}
+                  aria-label="Import preset JSON file"
+                />
+              </div>
+              {shareMessage && (
+                <p className="text-xs text-gray-400 mt-2" role="status">{shareMessage}</p>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -425,7 +669,7 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
               label={`Start (${formatSeconds(trimStart)})`} id="trimStart"
               value={trimStart}
               min={0} max={Math.max(0, (videoDuration as number) - 0.05)} step={0.05} unit="s"
-              onChange={(v) => onSettingsChange({
+              onChange={(v) => onSettingsChangeTransient({
                 ...settings,
                 trimStartSeconds: v,
                 trimEndSeconds: Math.max(v + 0.05, settings.trimEndSeconds ?? (videoDuration as number)),
@@ -437,7 +681,7 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
               value={trimEnd}
               min={Math.min(trimStart + 0.05, videoDuration as number)}
               max={videoDuration as number} step={0.05} unit="s"
-              onChange={(v) => onSettingsChange({
+              onChange={(v) => onSettingsChangeTransient({
                 ...settings,
                 trimEndSeconds: v,
                 trimStartSeconds: Math.min(v - 0.05, settings.trimStartSeconds ?? 0),
@@ -476,16 +720,36 @@ const ModificationControls: React.FC<ModificationControlsProps> = ({
         </select>
 
         <SliderControl
-          label={`Video bitrate ${settings.outputBitrateKbps === 0 ? '(auto)' : ''}`}
+          label="Fine-tune bitrate"
           id="outputBitrate"
           value={settings.outputBitrateKbps}
-          min={0} max={20000} step={500} unit=" kbps"
+          min={0} max={30000} step={500} unit=" kbps"
           onChange={(v) => updateNumber('outputBitrateKbps', v)}
           disabled={commonDisabledState}
         />
-        <p className="text-xs text-gray-400">
+        <p className="text-xs text-gray-400 mb-2">
           0 kbps lets the browser pick a default. Higher values produce larger, higher-quality files.
         </p>
+        <div className="flex flex-wrap gap-2" role="group" aria-label="Export quality presets">
+          {OUTPUT_QUALITY_PRESETS.map((preset) => {
+            const active = settings.outputBitrateKbps === preset.bitrateKbps;
+            return (
+              <button
+                key={preset.id}
+                onClick={() => onSettingsChange({ ...settings, outputBitrateKbps: preset.bitrateKbps })}
+                disabled={commonDisabledState}
+                title={preset.description}
+                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors disabled:opacity-50 ${
+                  active
+                    ? 'bg-indigo-600 text-white'
+                    : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                }`}
+              >
+                {preset.label}
+              </button>
+            );
+          })}
+        </div>
       </Section>
 
       <Section title="Effects & Geometry" initiallyOpen>
