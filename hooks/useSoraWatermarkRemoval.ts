@@ -8,11 +8,11 @@ import {
 } from '../types';
 import {
   detectSoraWatermark,
-  removeSoraWatermark,
   renderFillPreview,
   resolveTimeline,
   FillPreview,
 } from '../services/soraWatermarkService';
+import { removeSoraWatermark } from '../services/soraRemoval';
 
 const INITIAL_STATE: SoraRemovalState = {
   isDetecting: false,
